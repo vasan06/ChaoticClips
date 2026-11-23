@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.Python
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Dependencies
+pip-wheel-metadata/
+
+# Environment variables and API keys
+.env
+.env.*
+!.env.example
+
+# Flask
+instance/
+.webassets-cache/
+
+# Local workspace and downloaded media
+workspace/
+uploads/
+downloads/
+outputs/
+previews/
+temp/
+audio/
+
+# Video and audio files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+
+# Generated subtitles
+*.srt
+*.vtt
+*.ass
+
+# Logs
+*.log
+logs/
+
+# Cache and temporary files
+.cache/
+*.tmp
+*.temp
+*.bak
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+workspace/
+
+workspace/
+
+# Generated, runtime, and local environment directories
+_backup_before_pipeline*/
+.venv/
+clips/
+jobs/
+outputs/
+uploads/
+workspace/
+
+# Generated, runtime, and local environment directories
+_backup_before_pipeline*/
+.venv/
+clips/
+jobs/
+outputs/
+uploads/
+workspace/

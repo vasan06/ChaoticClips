@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clip Studio</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="wordmark" href="/">CLIP STUDIO</a>
+    <div class="topbar-right">LOCAL WORKSPACE <span class="status-dot"></span></div>
+  </header>
+
+  <main class="app">
+    <section class="intro">
+      <div class="eyebrow">VIDEO WORKSPACE</div>
+      <h1>Make the moments<br>worth keeping.</h1>
+      <p>Review, refine and export selected moments from a longer video.</p>
+    </section>
+
+    <section class="source section-card">
+      <div class="section-heading">
+        <div><span class="step">01</span><h2>Source video</h2></div>
+        <span class="section-note">Upload or paste a link</span>
+      </div>
+
+      <div class="source-tabs">
+        <button class="tab active" data-tab="urlPane">Video URL</button>
+        <button class="tab" data-tab="uploadPane">Upload file</button>
+      </div>
+
+      <div id="urlPane" class="source-pane">
+        <label for="videoUrl">Video link</label>
+        <div class="input-row">
+          <input id="videoUrl" type="url" placeholder="Paste a supported video URL">
+          <button id="inspectUrl" class="button button-dark">Inspect video</button>
+        </div>
+      </div>
+
+      <div id="uploadPane" class="source-pane hidden">
+        <label for="videoFile">Choose a video file</label>
+        <input id="videoFile" type="file" accept="video/*">
+        <p class="help">MP4, MOV, MKV, WEBM and other FFmpeg-supported formats.</p>
+      </div>
+
+      <div id="sourceStatus" class="status-line" aria-live="polite">
+        No source selected.
+      </div>
+
+      <div id="videoInfo" class="video-info hidden">
+        <img id="videoThumb" alt="Video thumbnail">
+        <div class="video-details">
+          <h3 id="videoTitle"></h3>
+          <p id="videoMeta"></p>
+          <p id="videoQuality"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings section-card">
+      <div class="section-heading">
+        <div><span class="step">02</span><h2>Clip specifications</h2></div>
+        <span class="section-note">Set before analysis</span>
+      </div>
+
+      <div class="settings-grid">
+        <div class="field">
+          <label for="clipCount">Number of clips</label>
+          <input id="clipCount" type="number" min="1" max="15"
+                 step="1" placeholder="Enter number (1–15)" required>
+        </div>
+        <div class="field">
+          <label for="aspectRatio">Aspect ratio</label>
+          <select id="aspectRatio">
+            <option value="9:16">9:16 · Vertical</option>
+            <option value="16:9">16:9 · Landscape</option>
+            <option value="1:1">1:1 · Square</option>
+            <option value="4:5">4:5 · Portrait feed</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="minDuration">Minimum duration</label>
+          <select id="minDuration">
+            <option>15</option><option selected>30</option>
+            <option>45</option><option>60</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="maxDuration">Maximum duration</label>
+          <select id="maxDuration">
+            <option>30</option><option selected>60</option>
+            <option>90</option><option>120</option><option>180</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="language">Transcript language</label>
+          <select id="language">
+            <option value="auto">Auto detect</option>
+            <option value="en">English</option><option value="hi">Hindi</option>
+            <option value="ta">Tamil</option><option value="te">Telugu</option>
+            <option value="es">Spanish</option><option value="fr">French</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="quality">Export quality</label>
+          <select id="quality">
+            <option value="1080" selected>1080p · Default</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="option-row">
+        <label class="check-label">
+          <input type="checkbox" id="captions" checked>
+          <span>Burn captions into preview and exported video</span>
+        </label>
+        <label class="check-label">
+          <input type="checkbox" id="gemini" checked>
+          <span>Use Gemini video understanding</span>
+        </label>
+      </div>
+
+      <div class="caption-settings">
+        <div class="field">
+          <label for="captionBg">Caption background</label>
+          <select id="captionBg">
+            <option value="black@0.72" selected>Black · Semi-transparent</option>
+            <option value="black@1">Black · Solid</option>
+            <option value="white@0.88">White · Semi-transparent</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="captionSize">Caption size</label>
+          <select id="captionSize">
+            <option value="medium" selected>Medium</option>
+            <option value="small">Small</option>
+            <option value="large">Large</option>
+          </select>
+        </div>
+      </div>
+
+      <button id="analyseButton" class="button button-dark button-wide" disabled>
+        Analyse and prepare previews
+      </button>
+      <p class="help">Analysis prepares review previews. It does not export final clips.</p>
+    </section>
+
+    <section id="progressSection" class="section-card hidden">
+      <div class="section-heading">
+        <div><span class="step">03</span><h2>Analysis progress</h2></div>
+        <strong id="progressPercent">0%</strong>
+      </div>
+      <div class="progress-track"><div id="progressBar"></div></div>
+      <p id="progressMessage" class="status-line">Waiting to start.</p>
+    </section>
+
+    <section id="reviewSection" class="review-section hidden">
+      <div class="review-header">
+        <div>
+          <span class="step">04</span>
+          <h2>Review your clips</h2>
+          <p>Play each preview, adjust its cut and approve only the moments you want.</p>
+        </div>
+        <div class="review-count" id="reviewCount">0 clips</div>
+      </div>
+
+      <div id="clipList" class="clip-list"></div>
+
+      <div class="export-panel">
+        <div>
+          <h3>Export approved clips</h3>
+          <p id="approvedSummary">No clips approved yet.</p>
+        </div>
+        <button id="exportButton" class="button button-dark" disabled>
+          Choose folder and export
+        </button>
+      </div>
+      <p id="exportStatus" class="status-line" aria-live="polite"></p>
+    </section>
+
+    <footer>
+      <span>CLIP STUDIO</span>
+      <span>Files remain on this computer unless an optional external AI service is enabled.</span>
+    </footer>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
