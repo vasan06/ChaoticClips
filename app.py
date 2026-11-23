@@ -1,1057 +1,314 @@
-# app.py
+"""Loopback-only HTTP entry point for ChaoticClips."""
+
+import argparse
+import hashlib
+import math
 import os
 import re
-import json
-import uuid
-import shutil
-import threading
-import subprocess
+import secrets
+import sys
+import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
 
-from flask import Flask, request, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
+from flask import Flask, Request, abort, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
+from chaoticclips import highlights, media
+from chaoticclips.picker import choose_folder
+from chaoticclips.studio import (
+    Busy, Conflict, IDENTIFIER, MAX_UPLOAD_BYTES, MEDIA_EXTENSIONS, Studio, identifier, public_source,
+)
 
-try:
-    from yt_dlp import YoutubeDL
-except ImportError:
-    YoutubeDL = None
-
-try:
-    from google import genai
-except ImportError:
-    genai = None
-
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "workspace"
-UPLOAD_DIR = DATA_DIR / "uploads"
-AUDIO_DIR = DATA_DIR / "audio"
-PREVIEW_DIR = DATA_DIR / "previews"
-TEMP_DIR = DATA_DIR / "temp"
-
-for folder in (UPLOAD_DIR, AUDIO_DIR, PREVIEW_DIR, TEMP_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
-
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024
-
-jobs = {}
-sources = {}
-clips = {}
-
-lock = threading.RLock()
-whisper_lock = threading.Lock()
-whisper_model = None
-
-ALLOWED_EXTENSIONS = {
-    ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"
+BASE = Path(__file__).resolve().parent
+LOOPBACK_HOST = re.compile(r"(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?", re.I)
+LANGUAGE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})?", re.I)
+COLOR = re.compile(r"#[a-f0-9]{6}", re.I)
+DEFAULTS = {
+    "count": 3, "min_duration": 20, "max_duration": 60, "target_duration": None,
+    "category": "auto", "ratio": "9:16", "resolution": "best", "language": "auto",
+    "subtitle_language": "source", "transcript_format": "none", "embed_subtitles": True,
+    "subtitle_size": 54, "subtitle_color": "#FFFFFF", "subtitle_background": "#151419",
+    "subtitle_position": "bottom", "quality": "standard",
+}
+SETTINGS_OPTIONS = {
+    "category": {"auto", "podcast", "education", "comedy", "motivation", "philosophy", "gaming", "story"},
+    "ratio": {"9:16", "16:9", "1:1", "4:5"}, "resolution": {"best", "1080", "720", "480"},
+    "transcript_format": {"none", "txt", "srt", "vtt"}, "subtitle_position": {"bottom", "middle", "top"},
+    "quality": {"standard", "high", "fast"},
 }
 
 
-def json_error(message, status=400):
-    return jsonify({"error": str(message)}), status
+def payload(allowed=None):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ValueError("Send a JSON object.")
+    if allowed is not None and data.keys() - allowed:
+        raise ValueError("This operation received unsupported fields.")
+    return data
 
 
-def run_command(args):
-    result = subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace"
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2500:] or "Media command failed.")
-    return result
+def number(value, low, high, label):
+    if type(value) not in {int, float} or not low <= value <= high or not math.isfinite(value):
+        raise ValueError(f"{label} must be between {low} and {high}.")
+    return value
 
 
-def ffmpeg_path():
-    return shutil.which("ffmpeg")
+def integer(value, low, high, label):
+    if type(value) is not int:
+        raise ValueError(f"{label} must be a whole number.")
+    return number(value, low, high, label)
 
 
-def ffprobe_path():
-    return shutil.which("ffprobe")
+def validate_settings(values):
+    settings = {**DEFAULTS, **values}
+    integer(settings["count"], 1, 12, "Clip count")
+    low = number(settings["min_duration"], 5, 180, "Minimum duration")
+    high = number(settings["max_duration"], 5, 180, "Maximum duration")
+    if high < low:
+        raise ValueError("Maximum duration must be at least the minimum duration.")
+    if settings["target_duration"] is not None:
+        number(settings["target_duration"], low, high, "Exact duration")
+    integer(settings["subtitle_size"], 24, 96, "Subtitle size")
+    if type(settings["embed_subtitles"]) is not bool:
+        raise ValueError("Embedded subtitles must be enabled or disabled.")
+    for key, options in SETTINGS_OPTIONS.items():
+        if not isinstance(settings[key], str) or settings[key] not in options:
+            raise ValueError(f"Choose a supported {key.replace('_', ' ')}.")
+    for key, default in (("language", "auto"), ("subtitle_language", "source")):
+        value = settings[key]
+        if not isinstance(value, str) or (value != default and not LANGUAGE.fullmatch(value)):
+            raise ValueError("Use a supported language code.")
+        settings[key] = value.casefold()
+    for key in ("subtitle_color", "subtitle_background"):
+        if not isinstance(settings[key], str) or not COLOR.fullmatch(settings[key]):
+            raise ValueError("Use six-digit subtitle colors.")
+    return settings
 
 
-def require_media_tools():
-    if not ffmpeg_path() or not ffprobe_path():
-        raise RuntimeError(
-            "FFmpeg and FFprobe are required. Install FFmpeg and add its bin folder to PATH."
-        )
-
-
-def safe_url(url):
-    parsed = urlparse(url or "")
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("Enter a valid HTTP or HTTPS video URL.")
-    return url
-
-
-def format_size(size):
-    if not size:
-        return "Unknown"
-    size = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} TB"
-
-
-def probe_video(path):
-    require_media_tools()
-    result = run_command([
-        ffprobe_path(), "-v", "error",
-        "-show_entries", "format=duration,size:stream=width,height",
-        "-of", "json", str(path)
-    ])
-    data = json.loads(result.stdout or "{}")
-    streams = data.get("streams", [])
-    fmt = data.get("format", {})
-    video = next((s for s in streams if "width" in s), {})
-    return {
-        "duration": float(fmt.get("duration") or 0),
-        "size": int(fmt.get("size") or 0),
-        "width": video.get("width"),
-        "height": video.get("height")
-    }
-
-
-def extract_metadata(url):
-    if YoutubeDL is None:
-        raise RuntimeError("yt-dlp is not installed.")
-
-    safe_url(url)
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extract_flat": False
-    }
-
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    if not info:
-        raise RuntimeError("Could not read video information.")
-
-    formats = info.get("formats") or []
-    heights = sorted({
-        f.get("height") for f in formats
-        if f.get("height") and f.get("vcodec") != "none"
-    }, reverse=True)
-
-    estimated = info.get("filesize") or info.get("filesize_approx")
-    if not estimated and info.get("duration"):
-        estimated = int(info["duration"] * 180000)
-
-    source_id = uuid.uuid4().hex
-    sources[source_id] = {
-        "kind": "url",
-        "url": url,
-        "title": info.get("title") or "Video",
-        "duration": float(info.get("duration") or 0),
-        "thumbnail": info.get("thumbnail"),
-        "formats": formats
-    }
-
-    return {
-        "source_id": source_id,
-        "title": info.get("title") or "Video",
-        "duration": float(info.get("duration") or 0),
-        "thumbnail": info.get("thumbnail"),
-        "width": info.get("width"),
-        "height": info.get("height"),
-        "available_heights": heights,
-        "estimated_size": format_size(estimated)
-    }
-
-
-def get_whisper():
-    global whisper_model
-    if WhisperModel is None:
-        raise RuntimeError("faster-whisper is not installed.")
-
-    if whisper_model is None:
-        with whisper_lock:
-            if whisper_model is None:
-                whisper_model = WhisperModel(
-                    "tiny",
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=4
-                )
-    return whisper_model
-
-
-def download_audio(source, source_id):
-    audio_path = AUDIO_DIR / f"{source_id}.%(ext)s"
-
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": str(audio_path),
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav"
-        }]
-    }
-
-    with YoutubeDL(options) as ydl:
-        ydl.download([source["url"]])
-
-    wav_path = AUDIO_DIR / f"{source_id}.wav"
-    if not wav_path.exists():
-        matches = list(AUDIO_DIR.glob(f"{source_id}.*"))
-        if not matches:
-            raise RuntimeError("Could not retrieve audio for transcription.")
-        return matches[0]
-    return wav_path
-
-
-def transcribe(path, language):
-    model = get_whisper()
-    lang = None if language == "auto" else language
-
-    segments, info = model.transcribe(
-        str(path),
-        language=lang,
-        beam_size=1,
-        vad_filter=True,
-        word_timestamps=False
+def create_app(data_dir=None, folder_picker=None):
+    root = data_dir if data_dir is not None else BASE / "workspace" / "studio"
+    studio = Studio(root, folder_picker or choose_folder, secrets.token_urlsafe(32))
+    app = Flask(__name__)
+    app.extensions["clipstudio"] = studio
+    app.config.update(
+        MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES + 1024**2,
+        MAX_FORM_MEMORY_SIZE=256 * 1024,
+        MAX_FORM_PARTS=4,
     )
 
-    output = []
-    for seg in segments:
-        text = (seg.text or "").strip()
-        if text:
-            output.append({
-                "start": float(seg.start),
-                "end": float(seg.end),
-                "text": text
-            })
+    class StudioRequest(Request):
+        def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+            return tempfile.SpooledTemporaryFile(max_size=512 * 1024, mode="w+b", dir=studio.tmp)
 
-    return output, getattr(info, "language", language)
+    app.request_class = StudioRequest
 
+    @app.before_request
+    def enforce_local_boundary():
+        if not LOOPBACK_HOST.fullmatch(request.host):
+            abort(400, "Use the application's loopback address.")
+        if request.path.startswith("/api/"):
+            token = request.headers.get("X-Clip-Token", "")
+            if not token.isascii() or not secrets.compare_digest(token, studio.token):
+                abort(403, "Refresh the studio page to start a local session.")
+            if request.method != "GET" and request.mimetype != "multipart/form-data":
+                if request.content_length is None or request.content_length > 16_384:
+                    abort(413, "The JSON request is too large.")
 
-def group_segments(segments, min_len, max_len):
-    """Build candidate windows from transcript timing and sentence boundaries."""
-    if not segments:
-        return []
-
-    candidates = []
-    i = 0
-
-    while i < len(segments):
-        start = segments[i]["start"]
-        chosen = []
-        j = i
-
-        while j < len(segments):
-            chosen.append(segments[j])
-            end = segments[j]["end"]
-            duration = end - start
-
-            if duration >= min_len:
-                text = " ".join(s["text"] for s in chosen).strip()
-                if duration <= max_len:
-                    candidates.append({
-                        "start": start,
-                        "end": end,
-                        "text": text,
-                        "segments": chosen[:]
-                    })
-                break
-
-            if duration > max_len:
-                break
-            j += 1
-
-        if j >= len(segments):
-            break
-
-        # Move forward enough to produce overlapping alternatives.
-        i = max(i + 1, j + 1)
-
-    # If no full-duration windows were formed, try sliding transcript windows.
-    if not candidates:
-        for i, first in enumerate(segments):
-            selected = []
-            for seg in segments[i:]:
-                selected.append(seg)
-                duration = seg["end"] - first["start"]
-                if duration >= min_len:
-                    if duration <= max_len:
-                        candidates.append({
-                            "start": first["start"],
-                            "end": seg["end"],
-                            "text": " ".join(x["text"] for x in selected),
-                            "segments": selected[:]
-                        })
-                    break
-                if duration > max_len:
-                    break
-
-    return candidates
-
-
-def score_candidate(candidate):
-    text = candidate["text"]
-    words = re.findall(r"\b[\w']+\b", text)
-    duration = max(.1, candidate["end"] - candidate["start"])
-    word_count = len(words)
-    density = word_count / duration
-
-    sentence_count = max(1, len(re.findall(r"[.!?]+", text)))
-    average_sentence = word_count / sentence_count
-    punctuation = len(re.findall(r"[!?]", text))
-
-    # General speech-structure signals, not a hardcoded topic keyword list.
-    density_score = min(1.0, density / 2.5)
-    structure_score = min(1.0, sentence_count / 3)
-    punctuation_score = min(1.0, punctuation / 3)
-    length_score = 1.0 if 20 <= word_count <= 130 else .55
-
-    score = (
-        density_score * 35
-        + structure_score * 25
-        + punctuation_score * 15
-        + length_score * 25
-    )
-
-    return round(score, 1)
-
-
-def local_candidates(segments, min_len, max_len, count):
-    windows = group_segments(segments, min_len, max_len)
-    for item in windows:
-        item["score"] = score_candidate(item)
-        item["reason"] = "Ranked using speech density, sentence structure and pacing."
-
-    windows.sort(key=lambda item: item["score"], reverse=True)
-
-    selected = []
-    for candidate in windows:
-        overlaps = any(
-            candidate["start"] < existing["end"] - 5
-            and candidate["end"] > existing["start"] + 5
-            for existing in selected
+    @app.after_request
+    def harden_response(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' https://i.ytimg.com https://*.ytimg.com https://img.youtube.com; "
+            "media-src 'self'; frame-src https://www.youtube-nocookie.com; connect-src 'self'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'self'"
         )
-        if not overlaps:
-            selected.append(candidate)
-        if len(selected) >= count:
-            break
+        if request.path.startswith("/api/") or request.path == "/":
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
-    return sorted(selected, key=lambda item: item["start"])
+    @app.errorhandler(ValueError)
+    def invalid(exc):
+        return jsonify(error=str(exc)), 400
 
+    @app.errorhandler(Conflict)
+    def conflict(exc):
+        return jsonify(error=str(exc)), 409
 
-def gemini_candidates(segments, min_len, max_len, count):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or genai is None:
-        return None
+    @app.errorhandler(Busy)
+    def busy(exc):
+        return jsonify(error=str(exc)), 429
 
-    transcript = "\n".join(
-        f'{s["start"]:.2f}-{s["end"]:.2f}: {s["text"]}'
-        for s in segments
-    )[:28000]
+    @app.errorhandler(KeyError)
+    def not_found(exc):
+        return jsonify(error="The requested source, job or clip was not found."), 404
 
-    prompt = f"""
-You are selecting short-form video moments from a timestamped transcript.
-Return only valid JSON: an array of objects with start, end, reason.
-Select up to {count} strong, self-contained moments.
-Each must be between {min_len} and {max_len} seconds.
-Prefer coherent ideas, complete stories, useful explanations, strong
-opinions, entertaining exchanges, surprising insights, clear hooks,
-or emotionally meaningful moments. Do not invent content.
-Use the supplied timestamps. Avoid overlapping selections.
-Transcript:
-{transcript}
-"""
+    @app.errorhandler(HTTPException)
+    def http_error(exc):
+        message = "Uploads must be 2 GiB or less." if exc.code == 413 and request.path == "/api/upload" else exc.description
+        return jsonify(error=message), exc.code
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
+    @app.get("/")
+    def index():
+        return render_template("index.html", api_token=studio.token)
 
-    raw = (response.text or "").strip()
-    raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
-    data = json.loads(raw)
+    @app.post("/api/metadata")
+    def metadata_route():
+        url = media.canonical_url(payload({"url"}).get("url"))
+        return accepted(studio.schedule("Queued to read YouTube metadata.",
+                                        lambda update, _: studio.inspect_remote(url, update)))
 
-    result = []
-    for item in data:
-        start = float(item["start"])
-        end = float(item["end"])
-        if end <= start or end - start < min_len or end - start > max_len:
-            continue
+    @app.post("/api/upload")
+    def upload_route():
+        if request.mimetype != "multipart/form-data":
+            raise ValueError("Choose a local video file.")
+        upload = request.files.get("file")
+        filename = (upload.filename if upload else "") or ""
+        filename = filename.replace("\\", "/").split("/")[-1][:255]
+        extension = Path(filename).suffix.casefold()
+        if extension not in MEDIA_EXTENSIONS:
+            raise ValueError("Choose an MP4, MOV, MKV, WebM, AVI or M4V video.")
+        path = studio.uploads / f"pending-{identifier()}{extension}"
+        digest = hashlib.sha256()
+        size = 0
+        queued = False
+        try:
+            with path.open("xb") as target:
+                while chunk := upload.stream.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        abort(413)
+                    digest.update(chunk)
+                    target.write(chunk)
+            if not size:
+                raise ValueError("The selected file is empty.")
+            job_id = studio.schedule("Queued to check the local video.",
+                                     lambda update, _: studio.inspect_local(path, filename, digest.hexdigest(), update))
+            queued = True
+            return accepted(job_id)
+        except OSError as exc:
+            raise ValueError("Could not store the upload. Check the available workspace disk space.") from exc
+        finally:
+            if not queued:
+                path.unlink(missing_ok=True)
 
-        matching = [
-            seg for seg in segments
-            if seg["end"] > start and seg["start"] < end
-        ]
-        if not matching:
-            continue
+    @app.post("/api/analyze")
+    def analyze_route():
+        data = payload(set(DEFAULTS) | {"source_id"})
+        source_id = data.pop("source_id", None)
+        settings = validate_settings(data)
+        source = studio.get("source", source_id)
+        return accepted(studio.schedule(
+            "Queued for speech analysis.",
+            lambda update, scratch: studio.analyze(source, settings, update, scratch),
+            details={"source": public_source(source), "settings": settings, "clip_ids": []},
+        ))
 
-        result.append({
-            "start": start,
-            "end": end,
-            "text": " ".join(s["text"] for s in matching),
-            "score": 90,
-            "reason": str(item.get("reason") or "Selected by contextual analysis."),
-            "segments": matching
-        })
+    @app.get("/api/job/<job_id>")
+    def job_route(job_id):
+        if not IDENTIFIER.fullmatch(job_id):
+            abort(404)
+        return jsonify(studio.read_job(job_id))
 
-    return result[:count]
+    @app.get("/preview/<revision>.mp4")
+    def preview_route(revision):
+        if not IDENTIFIER.fullmatch(revision):
+            abort(404)
+        path = studio.previews / f"{revision}.mp4"
+        if not path.is_file() or path.is_symlink():
+            abort(404)
+        return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
 
+    @app.post("/api/clips/<clip_id>/review")
+    def review_route(clip_id):
+        review = payload({"review"}).get("review")
+        if review not in ("approved", "rejected", "pending"):
+            raise ValueError("Choose a valid review decision.")
+        with studio.lock:
+            clip = studio.get("clip", clip_id)
+            if review == "approved" and studio.read_clip(clip_id)["preview_status"] != "ready":
+                raise Conflict("Prepare a playable preview before approving.")
+            if clip["preview_status"] == "pending":
+                raise Conflict("Wait for preview preparation to finish.")
+            clip["review"] = review
+            studio.db.put("clip", clip_id, clip)
+            return jsonify(clip=studio.read_clip(clip_id))
 
-def ffmpeg_preview(source_path, output_path, start, end, ratio):
-    require_media_tools()
-    duration = max(.1, end - start)
-
-    crop = {
-        "9:16": "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'",
-        "16:9": "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)'",
-        "1:1": "crop='min(iw,ih)':'min(iw,ih)'",
-        "4:5": "crop='min(iw,ih*4/5)':'min(ih,iw*5/4)'"
-    }.get(ratio, "null")
-
-    vf = "scale=720:-2"
-    if crop != "null":
-        vf = f"{crop},{vf}"
-
-    run_command([
-        ffmpeg_path(), "-y",
-        "-ss", str(start), "-i", str(source_path),
-        "-t", str(duration),
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-crf", "27", "-c:a", "aac", "-b:a", "96k",
-        "-movflags", "+faststart",
-        str(output_path)
-    ])
-
-
-def download_url_section(source, output_path, start, end, height=720):
-    if YoutubeDL is None:
-        raise RuntimeError("yt-dlp is not installed.")
-
-    safe_url(source["url"])
-    section = f"*{start:.3f}-{end:.3f}"
-
-    options = {
-        "format": (
-            f"bestvideo[height<={height}]+bestaudio/"
-            f"best[height<={height}]/best"
-        ),
-        "outtmpl": str(output_path.with_suffix(".%(ext)s")),
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "download_sections": [section],
-        "force_keyframes_at_cuts": True,
-        "merge_output_format": "mp4"
-    }
-
-    with YoutubeDL(options) as ydl:
-        ydl.download([source["url"]])
-
-    if output_path.exists():
-        return output_path
-
-    candidates = list(output_path.parent.glob(output_path.stem + ".*"))
-    candidates = [p for p in candidates if p.suffix.lower() in (".mp4", ".mkv", ".webm")]
-    if not candidates:
-        raise RuntimeError("This platform did not provide a partial preview download.")
-    if candidates[0] != output_path:
-        candidates[0].replace(output_path)
-    return output_path
-
-
-def create_preview(source, source_id, clip, clip_id, ratio):
-    output = PREVIEW_DIR / f"{clip_id}.mp4"
-
-    if source["kind"] == "upload":
-        ffmpeg_preview(
-            source["path"], output,
-            clip["start"], clip["end"], ratio
-        )
-    else:
-        download_url_section(
-            source, output,
-            clip["start"], clip["end"], 720
-        )
-
-    return output
-
-
-def update_job(job_id, **values):
-    with lock:
-        if job_id in jobs:
-            jobs[job_id].update(values)
-
-
-def analyze_worker(job_id, payload):
-    try:
-        source_id = payload["source_id"]
-        source = sources[source_id]
-
-        update_job(job_id, status="analyzing", progress=5, message="Preparing audio for transcription...")
-
-        if source["kind"] == "upload":
-            audio_path = source["path"]
-        else:
-            audio_path = download_audio(source, source_id)
-
-        update_job(job_id, progress=18, message="Transcribing speech locally...")
-        segments, detected_language = transcribe(audio_path, payload["language"])
-
-        if not segments:
-            raise RuntimeError("No usable speech was detected in this video.")
-
-        update_job(job_id, progress=52, message="Finding coherent moments...")
-        min_len = payload["min_duration"]
-        max_len = payload["max_duration"]
-        count = payload["count"]
-
-        selected = None
-        if payload.get("use_gemini"):
-            try:
-                selected = gemini_candidates(segments, min_len, max_len, count)
-            except Exception as exc:
-                update_job(
-                    job_id,
-                    message=f"Gemini unavailable; continuing locally. {str(exc)[:180]}"
-                )
-
-        if not selected:
-            selected = local_candidates(segments, min_len, max_len, count)
-
-        if not selected:
-            raise RuntimeError(
-                "Could not find enough suitable speech segments in the selected duration range."
+    @app.post("/api/clips/<clip_id>/preview")
+    def edit_route(clip_id):
+        data = payload({"start", "end"})
+        with studio.lock:
+            clip = studio.get("clip", clip_id)
+            if clip["preview_status"] == "pending":
+                raise Conflict("Wait for the current preview to finish.")
+            source = studio.get("source", clip["source_id"])
+            if data:
+                start = round(number(data.get("start"), 0, source["duration"], "Start"), 3)
+                end = min(source["duration"], round(number(data.get("end"), 0, source["duration"], "End"), 3))
+                if not 5 <= round(end - start, 3) <= 180:
+                    raise ValueError("Adjusted clips must last between 5 and 180 seconds.")
+                stored = studio.db.get("speech", clip["speech_key"])
+                if not stored:
+                    raise Conflict("Speech cache expired. Analyze the source again.")
+                context = highlights.clip_context(stored["words"], start, end)
+                if (start, end) != (clip["start"], clip["end"]):
+                    clip.update(start=start, end=end, duration=round(end - start, 3), text=context, edited=True)
+            clip.update(review="pending", preview_status="pending", preview_error=None, revision=None)
+            job_id = studio.schedule(
+                "Queued to prepare a section preview.", lambda update, _: studio.rerender(clip, source, update),
+                details={"clip_id": clip_id},
+                prepare=lambda: studio.db.put("clip", clip_id, clip),
             )
+        return accepted(job_id)
+
+    @app.post("/api/export")
+    def export_route():
+        data = payload({"clip_ids", "allow_preview_fallback"})
+        keys = data.get("clip_ids")
+        allow_fallback = data.get("allow_preview_fallback", False)
+        if type(allow_fallback) is not bool:
+            raise ValueError("Choose whether to allow the approved preview as an export fallback.")
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 12 or not all(
+            isinstance(key, str) and IDENTIFIER.fullmatch(key) for key in keys
+        ) or len(set(keys)) != len(keys):
+            raise ValueError("Choose 1 to 12 distinct approved clips.")
+        with studio.lock:
+            clips = studio.approved(keys)
+            return accepted(studio.schedule("Queued to open the destination picker.",
+                                            lambda update, scratch: studio.export(
+                                                clips, update, scratch, allow_fallback=allow_fallback)))
+
+    return app
+
+
+def accepted(job_id):
+    return jsonify(job_id=job_id), 202
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Start the local ChaoticClips server.")
+    parser.add_argument("--port", type=int, default=8000, help="Loopback port (default: 8000).")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+
+    workspace = BASE / "workspace" / "studio"
+    scratch = workspace / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    for key in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[key] = str(scratch)
+    tempfile.tempdir = str(scratch)
+    os.environ["HF_HOME"] = str(workspace / "models")
+    os.environ["XDG_CACHE_HOME"] = str(workspace / "cache")
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["FLASK_SKIP_DOTENV"] = "1"
+    sys.dont_write_bytecode = True
+    create_app(workspace).run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
 
-        # Exactly the requested number where enough candidates exist.
-        selected = selected[:count]
-        update_job(job_id, progress=65, message="Preparing individual preview segments...")
-
-        ready = []
-        for index, item in enumerate(selected):
-            clip_id = uuid.uuid4().hex
-            try:
-                preview = create_preview(
-                    source, source_id, item, clip_id, payload["ratio"]
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Could not prepare preview {index + 1}. "
-                    f"Partial download may not be supported by this source. Details: {exc}"
-                )
-
-            clip = {
-                "id": clip_id,
-                "job_id": job_id,
-                "source_id": source_id,
-                "start": item["start"],
-                "end": item["end"],
-                "text": item["text"],
-                "score": item["score"],
-                "reason": item["reason"],
-                "preview_path": str(preview),
-                "preview_url": f"/preview/{preview.name}",
-                "approved": False,
-                "rejected": False,
-                "segments": item.get("segments", []),
-                "settings": payload
-            }
-            clips[clip_id] = clip
-            ready.append({
-                k: clip[k] for k in (
-                    "id", "start", "end", "text", "score",
-                    "reason", "preview_url", "approved", "segments"
-                )
-            })
-
-            update_job(
-                job_id,
-                progress=65 + int(30 * (index + 1) / len(selected)),
-                message=f"Preparing preview {index + 1} of {len(selected)}..."
-            )
-
-        update_job(
-            job_id,
-            status="preview_ready",
-            progress=100,
-            message=f"{len(ready)} preview clips are ready. Review and approve them.",
-            clips=ready,
-            detected_language=detected_language
-        )
-
-    except Exception as exc:
-        update_job(
-            job_id,
-            status="error",
-            progress=100,
-            error=str(exc),
-            message="Analysis could not be completed."
-        )
-
-
-def choose_destination():
-    """Open the native Windows folder picker on the local machine."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        folder = filedialog.askdirectory(title="Choose a folder for approved clips")
-        root.destroy()
-        return folder
-    except Exception as exc:
-        raise RuntimeError(f"Could not open the Windows folder picker: {exc}")
-
-
-def srt_timestamp(seconds):
-    milliseconds = max(0, int(round(seconds * 1000)))
-    hours = milliseconds // 3600000
-    minutes = (milliseconds % 3600000) // 60000
-    secs = (milliseconds % 60000) // 1000
-    ms = milliseconds % 1000
-    return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
-
-
-def make_clip_srt(clip, srt_path):
-    lines = []
-    entries = clip.get("segments") or []
-
-    for segment in entries:
-        start = max(float(segment["start"]), clip["start"])
-        end = min(float(segment["end"]), clip["end"])
-        text = str(segment.get("text", "")).strip()
-
-        if end <= start or not text:
-            continue
-
-        relative_start = start - clip["start"]
-        relative_end = end - clip["start"]
-
-        lines.extend([
-            str(len(lines) // 4 + 1),
-            f"{srt_timestamp(relative_start)} --> {srt_timestamp(relative_end)}",
-            text.replace("-->", "—"),
-            ""
-        ])
-
-    if not lines and clip.get("text"):
-        duration = clip["end"] - clip["start"]
-        lines = [
-            "1",
-            f"00:00:00,000 --> {srt_timestamp(duration)}",
-            clip["text"].replace("-->", "—"),
-            ""
-        ]
-
-    srt_path.write_text("\n".join(lines), encoding="utf-8-sig")
-
-
-def escape_filter_path(path):
-    value = Path(path).resolve().as_posix()
-    return value.replace(":", r"\:").replace("'", r"\'")
-
-
-def export_one(clip, destination, quality):
-    require_media_tools()
-
-    source = sources[clip["source_id"]]
-    settings = clip["settings"]
-    height = int(quality)
-
-    clip_id = uuid.uuid4().hex
-    raw_path = TEMP_DIR / f"{clip_id}_source.mp4"
-    output = destination / (
-        f"clip_{clip['start']:.1f}_{clip['end']:.1f}_{clip_id[:5]}.mp4"
-    )
-
-    start = float(clip["start"])
-    end = float(clip["end"])
-    duration = end - start
-
-    # Retrieve only this selected time range for URL sources.
-    if source["kind"] == "url":
-        download_url_section(
-            source, raw_path, start, end, height
-        )
-    else:
-        run_command([
-            ffmpeg_path(), "-y",
-            "-ss", str(start),
-            "-i", source["path"],
-            "-t", str(duration),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-c", "copy",
-            str(raw_path)
-        ])
-
-    ratio = settings["ratio"]
-    crop_filters = {
-        "9:16": "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'",
-        "16:9": "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)'",
-        "1:1": "crop='min(iw,ih)':'min(iw,ih)'",
-        "4:5": "crop='min(iw,ih*4/5)':'min(ih,iw*5/4)'"
-    }
-
-    filters = [crop_filters[ratio], f"scale=-2:{height}"]
-
-    srt_path = TEMP_DIR / f"{clip_id}.srt"
-
-    if settings.get("captions"):
-        make_clip_srt(clip, srt_path)
-
-        size_map = {"small": 18, "medium": 25, "large": 32}
-        font_size = size_map.get(settings.get("caption_size"), 25)
-
-        bg = settings.get("caption_background", "black@0.72")
-        background_map = {
-            "black@0.72": "&H47000000",
-            "black@1": "&H00000000",
-            "white@0.88": "&H1FFFFFFF"
-        }
-        back_colour = background_map.get(bg, "&H47000000")
-
-        subtitle_filter = (
-            f"subtitles=filename='{escape_filter_path(srt_path)}'"
-            f":force_style='FontName=Arial,FontSize={font_size},"
-            f"PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,"
-            f"BackColour={back_colour},BorderStyle=3,Outline=0,"
-            f"Shadow=0,Alignment=2,MarginV=45'"
-        )
-        filters.append(subtitle_filter)
-
-    try:
-        run_command([
-            ffmpeg_path(), "-y",
-            "-i", str(raw_path),
-            "-vf", ",".join(filters),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-c:a", "aac",
-            "-b:a", "160k",
-            "-movflags", "+faststart",
-            str(output)
-        ])
-    finally:
-        raw_path.unlink(missing_ok=True)
-        srt_path.unlink(missing_ok=True)
-
-    size = output.stat().st_size
-    return {
-        "name": output.name,
-        "path": str(output),
-        "size_mb": round(size / (1024 * 1024), 2)
-    }
-
-def export_worker(job_id, approved_ids, destination, quality):
-    try:
-        exported = []
-        for index, clip_id in enumerate(approved_ids):
-            clip = clips.get(clip_id)
-            if not clip or not clip.get("approved"):
-                continue
-
-            result = export_one(clip, destination, quality)
-            exported.append(result)
-
-            update_job(
-                job_id,
-                status="exporting",
-                progress=int((index + 1) / len(approved_ids) * 100),
-                message=f"Exported {index + 1} of {len(approved_ids)} approved clips."
-            )
-
-        update_job(
-            job_id,
-            status="done",
-            progress=100,
-            message=f"Exported {len(exported)} approved clips.",
-            files=exported
-        )
-    except Exception as exc:
-        update_job(
-            job_id,
-            status="error",
-            progress=100,
-            error=str(exc),
-            message="Export failed."
-        )
-
-
-@app.get("/")
-def index():
-    return app.send_static_file("index.html") if (BASE_DIR / "static" / "index.html").exists() else (
-        __import__("flask").render_template("index.html")
-    )
-
-
-@app.post("/api/metadata")
-def api_metadata():
-    try:
-        data = request.get_json(force=True)
-        return jsonify(extract_metadata(data.get("url", "").strip()))
-    except Exception as exc:
-        return json_error(exc)
-
-
-@app.post("/api/upload")
-def api_upload():
-    file = request.files.get("video")
-    if not file or not file.filename:
-        return json_error("Choose a video file first.")
-
-    extension = Path(file.filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        return json_error("This video file type is not supported.")
-
-    source_id = uuid.uuid4().hex
-    filename = secure_filename(file.filename) or f"{source_id}{extension}"
-    path = UPLOAD_DIR / f"{source_id}_{filename}"
-    file.save(path)
-
-    try:
-        info = probe_video(path)
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-
-    sources[source_id] = {
-        "kind": "upload",
-        "path": str(path),
-        "title": filename,
-        "duration": info["duration"]
-    }
-
-    return jsonify({
-        "source_id": source_id,
-        "title": filename,
-        "filename": filename,
-        "duration": info["duration"],
-        "width": info["width"],
-        "height": info["height"],
-        "estimated_size": format_size(info["size"])
-    })
-
-
-@app.post("/api/analyze")
-def api_analyze():
-    data = request.get_json(force=True)
-    source_id = data.get("source_id")
-
-    if source_id not in sources:
-        return json_error("Source not found. Inspect or upload the video again.")
-    if data.get("count") in (None, ""):
-        return json_error("Enter how many clips you want to generate.")
-    try:
-        requested_count = int(data["count"])
-        if requested_count < 1 or requested_count > 15:
-            return json_error("Choose between 1 and 15 clips.")
-        payload = {
-            "source_id": source_id,
-            "count": requested_count,
-            "ratio": data.get("ratio", "9:16"),
-            "min_duration": max(5, int(data.get("min_duration", 30))),
-            "max_duration": max(10, int(data.get("max_duration", 60))),
-            "language": data.get("language", "auto"),
-            "quality": data.get("quality", "1080"),
-            "captions": bool(data.get("captions", True)),
-            "use_gemini": bool(data.get("use_gemini", False)),
-            "caption_background": data.get("caption_background", "black@0.72"),
-            "caption_size": data.get("caption_size", "medium")
-        }
-
-        if payload["min_duration"] > payload["max_duration"]:
-            return json_error("Minimum duration cannot exceed maximum duration.")
-
-        if payload["ratio"] not in ("9:16", "16:9", "1:1", "4:5"):
-            return json_error("Unsupported aspect ratio.")
-
-        job_id = uuid.uuid4().hex
-        jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress": 0,
-            "message": "Analysis queued.",
-            "clips": []
-        }
-
-        threading.Thread(
-            target=analyze_worker,
-            args=(job_id, payload),
-            daemon=True
-        ).start()
-
-        return jsonify({"job_id": job_id})
-
-    except Exception as exc:
-        return json_error(exc)
-
-
-@app.get("/api/job/<job_id>")
-def api_job(job_id):
-    with lock:
-        job = jobs.get(job_id)
-        if not job:
-            return json_error("Job not found.", 404)
-        return jsonify(job)
-
-
-@app.get("/preview/<filename>")
-def preview_file(filename):
-    return send_from_directory(PREVIEW_DIR, filename)
-
-
-@app.post("/api/clips/<clip_id>/adjust")
-def api_adjust_clip(clip_id):
-    clip = clips.get(clip_id)
-    if not clip:
-        return json_error("Clip not found.", 404)
-
-    data = request.get_json(force=True)
-    try:
-        start = float(data.get("start"))
-        end = float(data.get("end"))
-    except (TypeError, ValueError):
-        return json_error("Enter valid start and end times.")
-
-    source = sources[clip["source_id"]]
-    duration = float(source.get("duration") or 0)
-
-    if start < 0 or end <= start:
-        return json_error("End time must be greater than start time.")
-    if duration and end > duration:
-        return json_error("End time exceeds the source video duration.")
-
-    settings = clip["settings"]
-    min_len = settings["min_duration"]
-    max_len = settings["max_duration"]
-    if end - start < min_len or end - start > max_len:
-        return json_error(f"Clip duration must be between {min_len} and {max_len} seconds.")
-
-    old_preview = Path(clip["preview_path"])
-    try:
-        updated = dict(clip, start=start, end=end)
-        new_preview = create_preview(
-            source, clip["source_id"], updated,
-            f"{clip_id}_adjusted", settings["ratio"]
-        )
-
-        old_preview.unlink(missing_ok=True)
-        clip.update({
-            "start": start,
-            "end": end,
-            "preview_path": str(new_preview),
-            "preview_url": f"/preview/{new_preview.name}",
-            "approved": False
-        })
-        return jsonify({
-            "start": start,
-            "end": end,
-            "preview_url": clip["preview_url"]
-        })
-    except Exception as exc:
-        return json_error(exc)
-
-
-@app.post("/api/clips/<clip_id>/approval")
-def api_approval(clip_id):
-    clip = clips.get(clip_id)
-    if not clip:
-        return json_error("Clip not found.", 404)
-
-    data = request.get_json(force=True)
-    clip["approved"] = bool(data.get("approved", False))
-    clip["rejected"] = bool(data.get("rejected", False))
-    if clip["rejected"]:
-        clip["approved"] = False
-
-    return jsonify({
-        "id": clip_id,
-        "approved": clip["approved"],
-        "rejected": clip["rejected"]
-    })
-
-
-@app.post("/api/export")
-def api_export():
-    data = request.get_json(force=True)
-    job_id = data.get("job_id")
-    approved_ids = data.get("clip_ids") or []
-
-    valid_ids = [
-        clip_id for clip_id in approved_ids
-        if clip_id in clips
-        and clips[clip_id].get("approved")
-        and not clips[clip_id].get("rejected")
-        and clips[clip_id].get("job_id") == job_id
-    ]
-
-    if not valid_ids:
-        return json_error("Approve at least one clip before exporting.")
-
-    # Native folder picker is available because Flask runs on the same PC.
-    try:
-        destination_text = choose_destination()
-    except Exception as exc:
-        return json_error(exc, 500)
-
-    if not destination_text:
-        return jsonify({"message": "Export cancelled. No folder was selected."})
-
-    destination = Path(destination_text)
-    if not destination.exists() or not destination.is_dir():
-        return json_error("The selected destination folder is not available.")
-
-    quality = str(clips[valid_ids[0]]["settings"].get("quality", "1080"))
-    if quality not in ("480", "720", "1080"):
-        quality = "1080"
-
-    export_job = uuid.uuid4().hex
-    jobs[export_job] = {
-        "job_id": export_job,
-        "status": "exporting",
-        "progress": 0,
-        "message": "Starting export of approved clips.",
-        "files": []
-    }
-
-    threading.Thread(
-        target=export_worker,
-        args=(export_job, valid_ids, destination, quality),
-        daemon=True
-    ).start()
-
-    return jsonify({
-        "job_id": export_job,
-        "message": f"Exporting {len(valid_ids)} approved clips to your selected folder."
-    })
-
-
-# Install the bounded, AI-assisted pipeline overrides before Flask starts.
-from pipeline_v2 import install as _install_pipeline_v2
-_install_pipeline_v2(globals())
 
 if __name__ == "__main__":
-    require_media_tools()
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    main()
