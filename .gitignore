@@ -32,6 +32,8 @@ outputs/
 previews/
 temp/
 audio/
+clips/
+jobs/
 
 # Video and audio files
 *.mp4
@@ -76,24 +78,7 @@ Desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
-workspace/
 
-workspace/
-
-# Generated, runtime, and local environment directories
+# Private recovery snapshot
+/.rebuild-backup/
 _backup_before_pipeline*/
-.venv/
-clips/
-jobs/
-outputs/
-uploads/
-workspace/
-
-# Generated, runtime, and local environment directories
-_backup_before_pipeline*/
-.venv/
-clips/
-jobs/
-outputs/
-uploads/
-workspace/
