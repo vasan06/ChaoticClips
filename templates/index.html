@@ -41,7 +41,7 @@
               <button type="submit" class="button button-secondary">Load video</button>
             </div>
           </div>
-          <p class="help" id="sourceNote">Loads the title, duration, formats, and available captions. Video transfer starts only when preparing selected sections.</p>
+          <p class="help" id="sourceNote">Loads the title, duration, formats, and available captions.</p>
         </form>
 
         <form id="uploadForm" novalidate hidden>
@@ -69,6 +69,44 @@
             </dl>
           </div>
         </article>
+
+        <details class="source-disclosure" id="sourceContext" hidden>
+          <summary id="sourceContextToggle">Watch full source</summary>
+          <p class="help" id="sourcePlaybackHint"></p>
+          <video class="source-video" id="sourceVideo" aria-label="Full source video" controls playsinline preload="none" hidden></video>
+          <form id="sourceSeekForm" class="source-seek" novalidate hidden>
+            <div class="source-seek-label">
+              <label for="sourceRange">Source position</label>
+              <span class="timecode" id="sourceTime"></span>
+            </div>
+            <input id="sourceRange" type="range" min="0" max="0" step="0.001" value="0" aria-describedby="sourceTime">
+            <div class="input-action">
+              <div class="field">
+                <label for="sourceSeconds">Go to seconds</label>
+                <input id="sourceSeconds" type="number" min="0" step="0.001" value="0" aria-describedby="sourcePlaybackStatus" required>
+              </div>
+              <button class="button button-secondary" id="sourcePlay" type="submit">Play from this time</button>
+            </div>
+          </form>
+          <p class="status" id="sourcePlaybackStatus" role="status" aria-atomic="true"></p>
+        </details>
+
+        <details class="source-disclosure" id="attachRecovery" hidden>
+          <summary>Attach the same full-length video</summary>
+          <p class="help" id="recoveryHint">Choose the same version from your computer. ChaoticClips uses it to render unavailable previews and export existing cuts.</p>
+          <p class="status" id="attachmentName" hidden></p>
+          <form id="recoveryForm" novalidate>
+            <div class="field">
+              <label for="recoveryFile">Matching video file</label>
+              <div class="input-action upload-action">
+                <input id="recoveryFile" type="file" name="file" accept=".mp4,.mov,.mkv,.webm,.avi,.m4v" aria-describedby="recoveryHint recoveryStatus" required>
+                <button class="button button-secondary" type="submit">Attach video</button>
+              </div>
+            </div>
+          </form>
+          <progress id="recoveryProgress" aria-label="Matching video upload progress" max="100" hidden></progress>
+          <p class="status" id="recoveryStatus" role="status" aria-atomic="true"></p>
+        </details>
 
         <aside class="tip">
           <span class="tip-icon" aria-hidden="true">i</span>
@@ -168,21 +206,22 @@
       </div>
 
       <div class="empty-state" id="reviewEmpty">Load a video and start analysis to see suggested clips here.</div>
+      <button id="naturalDurationButton" class="button button-secondary" type="button" hidden>Find natural-length clips</button>
       <div id="reviewNotes" class="status" role="status" aria-atomic="true" hidden></div>
       <div id="clipList" class="clip-list"></div>
 
       <section class="panel export-panel" id="exportPanel" aria-labelledby="exportTitle" hidden>
         <div class="export-top">
           <div>
-            <div class="panel-heading"><span class="stage-no" aria-hidden="true">04</span><h2 id="exportTitle">Export</h2></div>
+            <div class="panel-heading"><span class="stage-no" aria-hidden="true">04</span><h2 id="exportTitle" tabindex="-1">Export</h2></div>
             <p id="approvedSummary" class="help"></p>
             <p id="exportSettings" class="help"></p>
-            <p class="help">Choose a destination in the Windows folder picker. Final rendering begins after you select a folder.</p>
+            <p class="help" id="exportFolderHint">Choose a destination in the Windows folder picker before saving any MP4. Final exports use your clip settings.</p>
             <label class="check-row" id="exportFallbackOption" hidden>
               <input id="exportFallback" type="checkbox"> Save the approved preview if YouTube export fails
             </label>
           </div>
-          <button class="button button-primary" id="exportButton" type="button" disabled>Export approved clips</button>
+          <button class="button button-primary" id="exportButton" type="button" disabled>Download approved clips</button>
         </div>
         <progress id="exportBar" max="100" aria-labelledby="exportTitle" hidden></progress>
         <p id="exportStatus" class="status" role="status" aria-atomic="true"></p>
@@ -202,17 +241,14 @@
       <div class="clip-preview">
         <div class="clip-media">
           <video controls playsinline preload="metadata" hidden></video>
-          <div class="youtube-frame" hidden></div>
           <div class="media-placeholder" hidden>
-            <p class="preview-state"></p>
+            <p class="preview-state" role="status"></p>
             <p class="preview-message"></p>
           </div>
         </div>
-        <div class="playback-tools" hidden>
-          <button class="button button-secondary" type="button" data-action="source-player" aria-expanded="false">Play YouTube segment</button>
-          <a class="source-preview-link" target="_blank" rel="noopener noreferrer">Open at timestamp</a>
+        <div class="playback-tools">
+          <button class="button button-secondary" type="button" data-action="source-player" aria-controls="sourceContext" disabled>View in source</button>
         </div>
-        <p class="help source-player-note" hidden>YouTube seeks are approximate. Use the rendered MP4 to verify the cut before approval and export.</p>
       </div>
       <div class="clip-content">
         <div class="clip-meta">
@@ -233,6 +269,9 @@
           <button class="button button-secondary" type="button" data-action="reject" disabled>Reject</button>
           <button class="button button-secondary" type="button" data-action="edit" aria-expanded="false" disabled>Edit timestamps</button>
           <button class="button button-secondary" type="button" data-action="retry" hidden disabled>Retry preview</button>
+          <button class="button button-secondary" type="button" data-action="attach" aria-controls="attachRecovery" hidden disabled>Attach matching video</button>
+          <button class="button button-primary" type="button" data-action="download" aria-describedby="exportFolderHint" hidden disabled>Download final MP4</button>
+          <button class="button button-secondary" type="button" data-action="save-preview" aria-describedby="exportFolderHint" hidden disabled>Save preview MP4</button>
         </div>
         <form class="clip-edit" novalidate hidden>
           <div class="settings-pair">

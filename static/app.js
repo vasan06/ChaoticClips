@@ -25,6 +25,17 @@ const state = {
   pendingClips: new Set(),
   jobs: { preview: {} },
 };
+const sourcePlayer = {
+  id: null,
+  directURL: "",
+  generation: 0,
+  busy: false,
+  offset: 0,
+  windowEnd: 0,
+  pendingSeek: null,
+  autoplay: false,
+  draft: false,
+};
 let lastSourceStatus = "";
 let lastSourceTone = "";
 
@@ -51,16 +62,17 @@ async function api(path, payload) {
   return data;
 }
 
-function uploadFile(file) {
+function uploadFile(file, path = "/api/upload", progressId = "uploadProgress", fields = {}) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     const payload = new FormData();
     payload.append("file", file);
-    request.open("POST", "/api/upload");
+    for (const [key, value] of Object.entries(fields)) payload.append(key, value);
+    request.open("POST", path);
     request.setRequestHeader("X-Clip-Token", token);
     request.responseType = "json";
     request.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) $("uploadProgress").value = Math.min(100, event.loaded / event.total * 100);
+      if (event.lengthComputable) $(progressId).value = Math.min(100, event.loaded / event.total * 100);
     });
     request.onload = () => {
       if (request.status >= 200 && request.status < 300 && request.response) {
@@ -150,9 +162,9 @@ function jobURL(id) {
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-async function followJob(id, onUpdate) {
+async function followJob(id, onUpdate, isCurrent = () => true) {
   let failures = 0;
-  for (;;) {
+  while (isCurrent()) {
     let job;
     try {
       job = await api(jobURL(id));
@@ -162,15 +174,17 @@ async function followJob(id, onUpdate) {
       await delay(700 * failures);
       continue;
     }
+    if (!isCurrent()) return null;
     onUpdate(job);
     if (terminalStatuses.has(job.status)) return job;
     await delay(850);
   }
+  return null;
 }
 
 function updateControls() {
   const workflowBusy = state.sourceBusy || state.analysisBusy || state.exportBusy || state.pendingClips.size > 0;
-  for (const input of document.querySelectorAll('input[name="source_mode"], #urlForm input, #urlForm button, #uploadForm input, #uploadForm button')) {
+  for (const input of document.querySelectorAll('input[name="source_mode"], #urlForm input, #urlForm button, #uploadForm input, #uploadForm button, #recoveryForm input, #recoveryForm button')) {
     input.disabled = workflowBusy;
   }
   $("analyzeButton").disabled = !state.source || workflowBusy;
@@ -179,8 +193,10 @@ function updateControls() {
   $("subtitleFields").disabled = !$("embedSubtitles").checked;
 
   const records = [...state.clips.values()];
-  const count = records.filter(({ clip }) => clip.review === "approved" && clip.preview_status === "ready").length;
+  const count = records.filter(({ clip }) => exportable(clip)).length;
   if (records.length) {
+    const ready = records.filter(({ clip }) => clip.preview_status === "ready").length;
+    setStatus($("reviewCount"), ready + " of " + records.length + " MP4 previews ready");
     setStatus($("approvedSummary"), count ? count + (count === 1 ? " clip approved" : " clips approved") : "Approve a clip after reviewing its preview.");
   }
   if (state.settings) {
@@ -191,7 +207,7 @@ function updateControls() {
     setStatus($("exportSettings"), output.join(" · "));
   }
   $("exportButton").disabled = !count || workflowBusy;
-  $("exportFallbackOption").hidden = state.source?.kind !== "youtube";
+  $("exportFallbackOption").hidden = state.source?.kind !== "youtube" || Boolean(state.source.attached_title);
   $("exportFallback").disabled = workflowBusy;
   busy($("exportButton"), state.exportBusy);
   for (const record of records) updateClipActions(record);
@@ -206,7 +222,18 @@ function switchMode(mode) {
 }
 
 function displaySource(source) {
+  const previous = state.source;
   state.source = source;
+  if (source.id !== previous?.id) {
+    $("attachRecovery").open = false;
+    $("recoveryForm").reset();
+    setStatus($("recoveryStatus"), "");
+  }
+  $("attachRecovery").hidden = source.kind !== "youtube";
+  $("attachmentName").hidden = !source.attached_title;
+  setStatus($("attachmentName"), source.attached_title ? "Attached video: " + source.attached_title : "", "success");
+  $("recoveryForm").hidden = Boolean(source.attached_title);
+  configureSourcePlayer(source);
   $("videoTitle").textContent = source.title || "Source video";
   $("videoDuration").textContent = formatTime(source.duration);
   $("videoFormats").textContent = source.formats?.length ? source.formats.join(", ") : "Source format";
@@ -268,7 +295,22 @@ function clearInvalid(form) {
   for (const control of form.querySelectorAll('[aria-invalid="true"]')) control.removeAttribute("aria-invalid");
 }
 
+function selectedVideo(input, status) {
+  const file = input.files[0];
+  if (!file) {
+    validateField(input, "Choose a video file first.", status);
+  } else if (!/\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(file.name)) {
+    validateField(input, "Choose a supported video file.", status);
+  } else if (!file.size || file.size > 2 * 1024 ** 3) {
+    validateField(input, "Choose a non-empty video up to 2 GiB.", status);
+  } else {
+    return file;
+  }
+  return null;
+}
+
 function clearReview(message = "Load a video and start analysis to see suggested clips here.") {
+  $("naturalDurationButton").hidden = true;
   $("exportFallback").checked = false;
   state.clips.clear();
   state.settings = null;
@@ -293,18 +335,10 @@ async function loadSource(event, usingUpload) {
   const form = event.currentTarget;
   const input = usingUpload ? $("videoFile") : $("videoUrl");
   const button = form.querySelector("button");
-  const value = usingUpload ? input.files[0] : input.value.trim();
   clearInvalid(form);
+  const value = usingUpload ? selectedVideo(input, $("sourceStatus")) : input.value.trim();
   if (!value) {
-    validateField(input, usingUpload ? "Choose a video file first." : "Paste a YouTube link.", $("sourceStatus"));
-    return;
-  }
-  if (usingUpload && !/\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(value.name)) {
-    validateField(input, "Choose a supported video file.", $("sourceStatus"));
-    return;
-  }
-  if (usingUpload && value.size > 2 * 1024 ** 3) {
-    validateField(input, "Choose a video up to 2 GiB.", $("sourceStatus"));
+    if (!usingUpload) validateField(input, "Paste a YouTube link.", $("sourceStatus"));
     return;
   }
   if (!usingUpload) {
@@ -417,7 +451,10 @@ function displaySettings(settings) {
 }
 
 function updateAnalysis(job) {
-  if (job.source && job.source.id !== state.source?.id) {
+  $("naturalDurationButton").hidden = !(job.status === "done" && !job.clips?.length && (job.natural_duration_available || job.settings?.target_duration));
+  if (job.source && (job.source.id !== state.source?.id
+      || job.source.playback_url !== state.source.playback_url
+      || job.source.attached_title !== state.source.attached_title)) {
     displaySource(job.source);
     sourceStatus("Video is ready for analysis.", "success");
     const mode = job.source.kind === "upload" ? "file" : "url";
@@ -431,9 +468,7 @@ function updateAnalysis(job) {
   if (Array.isArray(job.clips)) {
     for (const clip of job.clips) displayClip(clip);
     const count = state.clips.size;
-    const ready = job.clips.filter((clip) => clip.preview_status === "ready").length;
     $("reviewEmpty").hidden = count > 0;
-    setStatus($("reviewCount"), count ? ready + " of " + count + " MP4 previews ready" : "");
     $("exportPanel").hidden = count === 0;
     updateControls();
   }
@@ -457,7 +492,7 @@ async function trackAnalysis(id) {
     state.analysisBusy = false;
     if (!state.clips.size) {
       $("reviewEmpty").textContent = result.status === "done"
-        ? "No suitable clips were found. Try a wider duration range or a different source."
+        ? "No complete speech passage fits these settings. If an exact duration is set, try Find natural-length clips. For music or action-heavy footage, review the source and try a shorter speech passage."
         : "No clips are available. Review the analysis status and try again.";
     }
   } catch (error) {
@@ -499,14 +534,201 @@ async function startAnalysis(event) {
   }
 }
 
-function getMediaURL(value) {
+function getMediaURL(value, path = /^\/preview\/[a-f0-9]{32}\.mp4$/) {
   try {
     const url = new URL(value, location.href);
-    if (url.origin === location.origin && url.pathname.startsWith("/preview/")) return url.href;
+    if (url.origin === location.origin && path.test(url.pathname)) return url.href;
   } catch {
     // Feedback below offers to regenerate a preview when its URL is invalid.
   }
   return "";
+}
+
+function sourceRoute(action) {
+  return "/api/sources/" + encodeURIComponent(state.source.id) + "/" + action;
+}
+
+function clearSourceVideo() {
+  const video = $("sourceVideo");
+  video.pause();
+  video.hidden = true;
+  if (video.hasAttribute("src")) {
+    video.removeAttribute("src");
+    video.load();
+  }
+}
+
+function updateSourcePosition(seconds) {
+  const limit = Number($("sourceRange").max);
+  const value = Math.min(limit, Math.max(0, seconds));
+  $("sourceRange").value = value;
+  $("sourceSeconds").value = Math.round(value * 1000) / 1000;
+  $("sourceRange").setAttribute("aria-valuetext", formatTime(value));
+  $("sourceTime").textContent = formatTime(value) + " / " + formatTime(state.source.duration);
+}
+
+function updateSourceControls() {
+  $("sourceSeekForm").hidden = Boolean(sourcePlayer.directURL);
+  $("sourceSeekForm").querySelectorAll("input, button").forEach((control) => {
+    control.disabled = sourcePlayer.busy;
+  });
+  busy($("sourcePlay"), sourcePlayer.busy);
+  $("sourcePlaybackHint").textContent = sourcePlayer.directURL
+    ? "Use the player controls to play or seek anywhere in the original video."
+    : "Source playback loads short sections as you watch. Choose a position to play from anywhere in the video.";
+  for (const { node } of state.clips.values()) {
+    node.querySelector('[data-action="source-player"]').disabled = !state.source || sourcePlayer.busy;
+  }
+}
+
+function configureSourcePlayer(source) {
+  const directURL = getMediaURL(source.playback_url, /^\/source\/[a-f0-9]{32}\/original$/);
+  $("sourceContext").hidden = false;
+  if (sourcePlayer.id === source.id && sourcePlayer.configuredURL === directURL) return;
+  const newSource = sourcePlayer.id !== source.id;
+  Object.assign(sourcePlayer, {
+    id: source.id, directURL, configuredURL: directURL, generation: sourcePlayer.generation + 1,
+    busy: false, offset: 0, windowEnd: 0, pendingSeek: null, autoplay: false, draft: false,
+  });
+  clearSourceVideo();
+  if (newSource) $("sourceContext").open = false;
+  const lastMoment = Math.max(0, Math.floor(source.duration * 1000 - 1) / 1000);
+  $("sourceRange").max = lastMoment;
+  $("sourceSeconds").max = lastMoment;
+  updateSourcePosition(0);
+  updateSourceControls();
+  setStatus($("sourcePlaybackStatus"), "");
+  if ($("sourceContext").open && directURL) loadOriginal();
+}
+
+function loadOriginal(seconds = null) {
+  const video = $("sourceVideo");
+  if (seconds !== null) sourcePlayer.pendingSeek = seconds;
+  video.hidden = false;
+  if (video.src !== sourcePlayer.directURL) {
+    video.preload = "metadata";
+    video.src = sourcePlayer.directURL;
+  } else if (video.readyState >= 1) {
+    positionSourceVideo();
+  }
+}
+
+function positionSourceVideo() {
+  const video = $("sourceVideo");
+  const { pendingSeek, offset, autoplay, generation } = sourcePlayer;
+  sourcePlayer.pendingSeek = null;
+  sourcePlayer.autoplay = false;
+  if (pendingSeek !== null) {
+    video.currentTime = Math.max(0, pendingSeek - offset);
+  }
+  if (autoplay) video.play().catch(() => {
+    if (generation === sourcePlayer.generation && $("sourceContext").open && !video.error) {
+      setStatus($("sourcePlaybackStatus"), "Press Play in the source player to continue.");
+    }
+  });
+}
+
+async function loadSourceWindow(seconds, autoplay) {
+  if (!state.source || sourcePlayer.busy) return;
+  const generation = ++sourcePlayer.generation;
+  const current = () => generation === sourcePlayer.generation;
+  const video = $("sourceVideo");
+  sourcePlayer.busy = true;
+  video.pause();
+  video.hidden = true;
+  updateSourcePosition(seconds);
+  updateSourceControls();
+  setStatus($("sourcePlaybackStatus"), "Loading source at " + formatTime(seconds) + "…");
+  try {
+    const { job_id: id } = await api(sourceRoute("playback"), { time: seconds });
+    const job = await followJob(id, () => {}, current);
+    if (!current()) return;
+    const url = getMediaURL(job.playback_url, /^\/context\/[a-f0-9]{32}\.mp4$/);
+    if (job.status !== "done" || !url || !Number.isFinite(job.start) || !(job.end > job.start)) {
+      throw new RequestError(job.error || "The source section could not be played.");
+    }
+    Object.assign(sourcePlayer, {
+      offset: job.start, windowEnd: job.end, pendingSeek: seconds,
+      autoplay: autoplay && $("sourceContext").open, draft: false,
+    });
+    video.hidden = false;
+    if (video.src === url && video.readyState >= 1) {
+      positionSourceVideo();
+    } else {
+      video.preload = "metadata";
+      video.src = url;
+    }
+    updateSourcePosition(seconds);
+    setStatus($("sourcePlaybackStatus"), "");
+  } catch (error) {
+    if (!current()) return;
+    video.hidden = !video.hasAttribute("src") || Boolean(video.error);
+    setStatus($("sourcePlaybackStatus"), error.message + (state.source.kind === "youtube" && !state.source.attached_title
+      ? " Retry this position or attach the same full-length video."
+      : " Try playing from this position again."), "error");
+  } finally {
+    if (current()) {
+      sourcePlayer.busy = false;
+      updateSourceControls();
+    }
+  }
+}
+
+function viewSource(seconds) {
+  $("sourceContext").open = true;
+  $("sourceContextToggle").focus();
+  if (sourcePlayer.directURL) {
+    loadOriginal(seconds);
+  } else {
+    updateSourcePosition(seconds);
+    void loadSourceWindow(seconds, false);
+  }
+}
+
+async function attachVideo(event) {
+  event.preventDefault();
+  if ($("recoveryFile").disabled || state.source?.kind !== "youtube" || state.source.attached_title) return;
+  const status = $("recoveryStatus");
+  const form = event.currentTarget;
+  clearInvalid(form);
+  const file = selectedVideo($("recoveryFile"), status);
+  if (!file) return;
+  const fields = state.jobs.analysis ? { analysis_job_id: state.jobs.analysis } : {};
+  const bar = $("recoveryProgress");
+  const button = form.querySelector("button");
+  state.sourceBusy = true;
+  updateControls();
+  busy(button, true);
+  bar.hidden = false;
+  bar.removeAttribute("value");
+  setStatus(status, "Copying the matching video into the workspace…");
+  try {
+    const { job_id: id } = await uploadFile(file, sourceRoute("attach"), "recoveryProgress", fields);
+    const result = await followJob(id, (job) => {
+      progress(bar, null, job.progress);
+      setStatus(status, job.message || "Preparing the matching video…");
+      if (job.clips) for (const clip of job.clips) displayClip(clip);
+    });
+    if (result.status !== "done" || !result.source) {
+      throw new RequestError(result.error || "The matching video could not be attached.");
+    }
+    displaySource(result.source);
+    if (result.clips) for (const clip of result.clips) displayClip(clip);
+    form.reset();
+    setStatus(status, result.message || "Matching video attached.", "success");
+    $("attachRecovery").querySelector("summary").focus();
+  } catch (error) {
+    setStatus(status, error.message, "error");
+  } finally {
+    state.sourceBusy = false;
+    bar.hidden = true;
+    busy(button, false);
+    updateControls();
+  }
+}
+
+function exportable(clip) {
+  return clip.review === "approved" && clip.preview_status === "ready";
 }
 
 function updateClipActions(record) {
@@ -525,44 +747,30 @@ function updateClipActions(record) {
   retry.hidden = !(playbackError || clip.preview_status === "error" || reconnect);
   retry.disabled = busy;
   retry.textContent = reconnect ? "Reconnect to preview" : "Retry preview";
+  const attach = node.querySelector('[data-action="attach"]');
+  attach.hidden = !(clip.preview_status === "error" && state.source?.kind === "youtube" && !state.source.attached_title);
+  attach.disabled = busy || state.analysisBusy;
+  const source = node.querySelector('[data-action="source-player"]');
+  source.disabled = !state.source || sourcePlayer.busy;
+  for (const download of node.querySelectorAll('[data-action="download"], [data-action="save-preview"]')) {
+    download.hidden = !exportable(clip);
+    download.disabled = busy || state.analysisBusy || state.pendingClips.size > 0;
+  }
   for (const control of node.querySelectorAll(".clip-edit input, .clip-edit button")) control.disabled = locked;
   node.setAttribute("aria-busy", String(state.pendingClips.has(clip.id)));
 }
 
-function sourcePlayback(clip) {
-  if (state.source?.kind !== "youtube") return null;
-  const id = new URL(state.source.url, location.origin).searchParams.get("v");
-  if (!id || !/^[\w-]{11}$/.test(id) || !Number.isFinite(clip.start) || !Number.isFinite(clip.end)) return null;
-  const start = Math.floor(clip.start);
-  const end = Math.ceil(clip.end);
-  return {
-    embed: "https://www.youtube-nocookie.com/embed/" + id + "?" + new URLSearchParams({start, end, autoplay: 1, playsinline: 1, rel: 0}),
-    watch: "https://www.youtube.com/watch?" + new URLSearchParams({v: id, t: start + "s"}),
-  };
-}
-
 function updatePlayer(record) {
-  const { node, clip, mediaURL, playbackError, sourceActive } = record;
+  const { node, clip, mediaURL, playbackError } = record;
   const video = node.querySelector("video");
-  const frame = node.querySelector(".youtube-frame");
-  const button = node.querySelector('[data-action="source-player"]');
   const ready = Boolean(mediaURL) && !playbackError;
-  video.hidden = sourceActive || !ready;
-  frame.hidden = !sourceActive;
-  node.querySelector(".media-placeholder").hidden = sourceActive || ready;
-  button.textContent = sourceActive ? (ready ? "Switch to MP4 preview" : "Close YouTube player") : "Play YouTube segment";
-  button.setAttribute("aria-expanded", String(sourceActive));
-  node.querySelector(".source-player-note").hidden = !sourceActive;
+  video.hidden = !ready;
+  node.querySelector(".media-placeholder").hidden = ready;
   const pending = clip.preview_status === "pending";
   setStatus(node.querySelector(".preview-state"), pending ? "Preparing MP4" : "MP4 unavailable");
   setStatus(node.querySelector(".preview-message"), playbackError ? "The browser could not play the MP4. Try regenerating it."
-    : pending ? "You can start reviewing the moment now." : clip.preview_error || "The preview could not be prepared.");
-}
-
-function closeSourcePlayer(record) {
-  record.sourceActive = false;
-  record.node.querySelector(".youtube-frame").replaceChildren();
-  updatePlayer(record);
+    : pending ? "You can check the timestamps and context while the cut renders."
+      : (clip.preview_error || "The preview could not be prepared.") + " Retry the preview to make the selected cut.");
 }
 
 function displayClip(clip) {
@@ -573,10 +781,8 @@ function displayClip(clip) {
     const edit = node.querySelector(".clip-edit");
     status.id = "clip-status-" + clip.id;
     edit.id = "clip-edit-" + clip.id;
-    node.querySelector(".youtube-frame").id = "source-player-" + clip.id;
-    node.querySelector('[data-action="source-player"]').setAttribute("aria-controls", "source-player-" + clip.id);
     node.querySelector('[data-action="edit"]').setAttribute("aria-controls", edit.id);
-    record = { node, clip, mediaURL: null, playbackError: false, sourceActive: false, playback: null };
+    record = { node, clip, mediaURL: null, playbackError: false };
     state.clips.set(clip.id, record);
     node.addEventListener("click", (event) => handleClipAction(record, event));
     edit.addEventListener("submit", (event) => submitEdit(record, event));
@@ -587,10 +793,10 @@ function displayClip(clip) {
       updateClipActions(record);
     });
     node.querySelector("video").addEventListener("play", () => {
+      $("sourceVideo").pause();
       for (const other of state.clips.values()) {
         if (other === record) continue;
         other.node.querySelector("video").pause();
-        if (other.sourceActive) closeSourcePlayer(other);
       }
     });
     $("clipList").append(node);
@@ -638,11 +844,6 @@ function displayClip(clip) {
     }
   }
   video.setAttribute("aria-label", "Preview from " + formatTime(clip.start) + " to " + formatTime(clip.end));
-  const playback = sourcePlayback(clip);
-  if (record.sourceActive && playback?.embed !== record.playback?.embed) closeSourcePlayer(record);
-  record.playback = playback;
-  node.querySelector(".playback-tools").hidden = !playback;
-  if (playback) node.querySelector(".source-preview-link").href = playback.watch;
   updatePlayer(record);
   updateClipActions(record);
   return record;
@@ -669,24 +870,16 @@ async function handleClipAction(record, event) {
   if (!action) return;
   const { clip, node } = record;
   if (action === "source-player") {
-    if (!record.playback) return;
-    if (record.sourceActive) {
-      closeSourcePlayer(record);
-      return;
-    }
-    for (const other of state.clips.values()) {
-      other.node.querySelector("video").pause();
-      if (other.sourceActive) closeSourcePlayer(other);
-    }
-    const player = document.createElement("iframe");
-    player.title = "YouTube segment from " + formatTime(clip.start) + " to " + formatTime(clip.end);
-    player.referrerPolicy = "strict-origin-when-cross-origin";
-    player.allow = "autoplay; fullscreen; encrypted-media; picture-in-picture";
-    player.allowFullscreen = true;
-    player.src = record.playback.embed;
-    node.querySelector(".youtube-frame").replaceChildren(player);
-    record.sourceActive = true;
-    updatePlayer(record);
+    viewSource(clip.start);
+    return;
+  }
+  if (action === "attach") {
+    $("attachRecovery").open = true;
+    $("recoveryFile").focus();
+    return;
+  }
+  if (action === "download" || action === "save-preview") {
+    await startExport([clip.id], action === "save-preview");
     return;
   }
   if (action === "edit" || action === "cancel-edit") {
@@ -869,22 +1062,24 @@ async function trackExport(id) {
   }
 }
 
-async function startExport() {
+async function startExport(clipIds = null, savePreview = false) {
   if ($("exportButton").disabled) return;
   const ids = [...state.clips.values()]
-    .filter(({ clip }) => clip.preview_status === "ready" && clip.review === "approved")
+    .filter(({ clip }) => exportable(clip) && (!clipIds || clipIds.includes(clip.id)))
     .map(({ clip }) => clip.id);
+  if (!ids.length) return;
   state.exportBusy = true;
   updateControls();
   $("exportResults").hidden = true;
   reconnectButton("exportReconnect", false);
   $("exportBar").hidden = true;
   setStatus($("exportStatus"), "Opening the folder picker on this computer…");
+  $("exportTitle").focus();
   try {
-    const { job_id: id } = await api("/api/export", {
-      clip_ids: ids,
-      allow_preview_fallback: state.source?.kind === "youtube" && $("exportFallback").checked,
-    });
+    const options = { clip_ids: ids };
+    if (savePreview) options.mode = "preview";
+    else options.allow_preview_fallback = !$("exportFallbackOption").hidden && $("exportFallback").checked;
+    const { job_id: id } = await api("/api/export", options);
     markJob("export", id);
     await trackExport(id);
   } catch (error) {
@@ -921,10 +1116,72 @@ for (const input of document.querySelectorAll('input[name="source_mode"]')) {
 $("videoThumb").addEventListener("error", () => { $("thumbnailFrame").hidden = true; });
 $("urlForm").addEventListener("submit", (event) => loadSource(event, false));
 $("uploadForm").addEventListener("submit", (event) => loadSource(event, true));
+$("recoveryForm").addEventListener("submit", attachVideo);
+$("sourceContext").addEventListener("toggle", () => {
+  if (!$("sourceContext").open) $("sourceVideo").pause();
+  else if (sourcePlayer.directURL) loadOriginal();
+});
+$("sourceRange").addEventListener("input", (event) => {
+  sourcePlayer.draft = true;
+  updateSourcePosition(event.target.valueAsNumber);
+});
+$("sourceSeconds").addEventListener("input", (event) => {
+  sourcePlayer.draft = true;
+  const seconds = event.target.valueAsNumber;
+  if (Number.isFinite(seconds)) {
+    $("sourceRange").value = seconds;
+    $("sourceRange").setAttribute("aria-valuetext", formatTime(Number($("sourceRange").value)));
+    $("sourceTime").textContent = formatTime(Number($("sourceRange").value)) + " / " + formatTime(state.source.duration);
+  }
+});
+$("sourceSeekForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (sourcePlayer.busy) return;
+  const field = $("sourceSeconds");
+  clearInvalid(event.currentTarget);
+  if (!field.validity.valid) {
+    validateField(field, "Enter seconds within the source video.", $("sourcePlaybackStatus"));
+    return;
+  }
+  void loadSourceWindow(field.valueAsNumber, true);
+});
+$("sourceVideo").addEventListener("loadedmetadata", positionSourceVideo);
+$("sourceVideo").addEventListener("timeupdate", (event) => {
+  if (state.source && !sourcePlayer.directURL && !sourcePlayer.busy && !sourcePlayer.draft && !event.target.hidden) {
+    updateSourcePosition(sourcePlayer.offset + event.target.currentTime);
+  }
+});
+$("sourceVideo").addEventListener("play", () => {
+  for (const { node } of state.clips.values()) node.querySelector("video").pause();
+});
+$("sourceVideo").addEventListener("ended", () => {
+  const { directURL, offset, windowEnd } = sourcePlayer;
+  if (!directURL && $("sourceContext").open && windowEnd > offset && windowEnd < state.source.duration - 0.001) {
+    void loadSourceWindow(windowEnd, true);
+  }
+});
+$("sourceVideo").addEventListener("error", (event) => {
+  if (!event.target.hasAttribute("src")) return;
+  const status = $("sourcePlaybackStatus");
+  if (sourcePlayer.directURL) {
+    sourcePlayer.directURL = "";
+    clearSourceVideo();
+    updateSourceControls();
+    setStatus(status, "This browser could not play the original file directly. Choose a source position to play a compatible section.", "error");
+  } else {
+    event.target.hidden = true;
+    setStatus(status, "This source section could not play. Try playing from this position again.", "error");
+  }
+});
+$("naturalDurationButton").addEventListener("click", () => {
+  if ($("analyzeButton").disabled) return;
+  $("targetDuration").value = "";
+  $("settingsForm").requestSubmit();
+});
 $("settingsForm").addEventListener("submit", startAnalysis);
 $("embedSubtitles").addEventListener("change", updateControls);
 $("language").addEventListener("change", () => { $("languageCodeField").hidden = $("language").value !== "other"; });
-$("exportButton").addEventListener("click", startExport);
+$("exportButton").addEventListener("click", () => startExport());
 $("analysisReconnect").addEventListener("click", () => trackAnalysis(state.jobs.analysis));
 $("exportReconnect").addEventListener("click", () => trackExport(state.jobs.export));
 updateControls();

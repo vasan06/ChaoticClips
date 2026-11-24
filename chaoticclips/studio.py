@@ -42,7 +42,18 @@ def matches_language(requested, actual):
 
 
 def public_source(source):
-    return {key: value for key, value in source.items() if key not in {"path", "fingerprint"}}
+    public = {key: value for key, value in source.items()
+              if key not in {"path", "fingerprint", "attached_id", "browser_playable"}}
+    if source.get("browser_playable") or source.get("kind") == "upload" and browser_playable(source):
+        public["playback_url"] = f"/source/{source['id']}/original"
+    return public
+
+
+def browser_playable(source):
+    ext = Path(source.get("path", "")).suffix.lower()
+    video, audio = source.get("video_codec"), source.get("audio_codec")
+    return ((ext in {".mp4", ".m4v"} and video == "h264" and audio in {None, "aac", "mp3"})
+            or (ext == ".webm" and video in {"vp8", "vp9", "av1"} and audio in {None, "opus", "vorbis"}))
 
 
 def operational_error(exc, fallback):
@@ -116,9 +127,11 @@ class Studio:
         self.picker_lock = threading.Lock()
         self.tmp = self.root / "scratch"
         self.previews = self.root / "previews"
+        self.context_media = self.root / "context"
+        self.context_jobs = {}
         self.uploads = self.root / "uploads"
         self.models = self.root / "models"
-        for directory in (self.tmp, self.previews, self.uploads, self.models):
+        for directory in (self.tmp, self.previews, self.uploads, self.models, self.context_media):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Store(self.root / "studio.sqlite3")
         self.db.recover()
@@ -128,7 +141,8 @@ class Studio:
     def cleanup(self):
         cutoff = time.time() - MEDIA_TTL
         for directory, pattern in ((self.previews, "*.mp4"), (self.uploads, "pending-*"),
-                                   (self.tmp, "task-*"), (self.previews, ".render-*")):
+                                   (self.tmp, "task-*"), (self.previews, ".render-*"),
+                                   (self.context_media, ".render-*"), (self.context_media, "*.mp4")):
             for path in directory.glob(pattern):
                 try:
                     if not path.is_symlink() and path.stat().st_mtime < cutoff:
@@ -187,6 +201,10 @@ class Studio:
         job = self.db.get("job", job_id)
         if job is None:
             raise KeyError(job_id)
+        if job.get("source"):
+            latest = self.db.get("source", job["source"]["id"])
+            if latest:
+                job["source"] = public_source(latest)
         if "clip_ids" in job:
             job["clips"] = [self.read_clip(key) for key in job.pop("clip_ids")]
         if "clip_id" in job:
@@ -198,6 +216,13 @@ class Studio:
         revision = clip.get("revision")
         internal = {"revision", "source_id", "speech_key", "subtitle_key", "settings"}
         public = {key: value for key, value in clip.items() if key not in internal}
+        # Older saved failures included instructions for a removed third-party player.
+        message = public.get("preview_error") or ""
+        if "YouTube player" in message:
+            reason = message.partition(" Review the moment")[0].partition(" You can review")[0]
+            if "section transfer limit" in reason:
+                reason = "The selected section did not finish transferring."
+            public["preview_error"] = reason + " Retry the preview or attach the same full-length original."
         if clip["preview_status"] == "ready":
             if revision and (self.previews / f"{revision}.mp4").is_file():
                 public["preview_url"] = f"/preview/{revision}.mp4"
@@ -242,6 +267,104 @@ class Studio:
             if not committed:
                 original.unlink(missing_ok=True)
 
+    def media_source(self, source):
+        if source.get("attached_id"):
+            return self.get("source", source["attached_id"])
+        return source
+
+    def attach_original(self, source_id, analysis_id, pending, filename, digest, update):
+        """Keep the YouTube timeline and transcript; use the supplied original for its pixels."""
+        try:
+            with self.lock:
+                source = self.get("source", source_id)
+                if source["kind"] != "youtube":
+                    raise ValueError("Attach an original to a YouTube source.")
+                ids = []
+                if analysis_id:
+                    job = self.get("job", analysis_id)
+                    if job.get("source", {}).get("id") != source_id or "clip_ids" not in job:
+                        raise ValueError("The selected analysis belongs to a different source.")
+                    if job["status"] not in {"done", "error"}:
+                        raise ValueError("Wait for the analysis to finish before attaching a file.")
+                    ids = job["clip_ids"]
+                if source.get("attached_id"):
+                    local = self.media_source(source)
+                    if local["fingerprint"] != digest:
+                        raise ValueError("This source already has a different original attached. Load a new source to use another edit.")
+                else:
+                    update(progress=10, message="Checking the full-length original against the source duration.")
+                    local = media.inspect_upload(pending)
+                    if abs(local["duration"] - source["duration"]) > 1:
+                        raise ValueError("The file duration differs from the YouTube video. Choose the same full-length edit.")
+                    if not local.get("audio_codec"):
+                        raise ValueError("Choose the full-length original with its audio track.")
+                    original = pending.with_name(f"{identifier()}{pending.suffix}")
+                    pending.rename(original)
+                    local.update(path=str(original), title=filename, fingerprint=digest)
+                    try:
+                        self.save_source(local)
+                    except Exception:
+                        original.unlink(missing_ok=True)
+                        raise
+                    source.update(attached_id=local["id"], attached_title=filename,
+                                  browser_playable=browser_playable(local))
+                    self.db.put("source", source_id, source)
+                retry = []
+                for key in ids:
+                    if (self.read_clip(key)["preview_status"] == "error"
+                            and self.get("clip", key)["review"] != "rejected"):
+                        clip = self.get("clip", key)
+                        clip.update(review="pending", preview_status="pending", preview_error=None, revision=None)
+                        self.db.put("clip", key, clip)
+                        retry.append(clip)
+            update(source=public_source(source), clip_ids=ids, progress=25,
+                   message=f"Original attached. Preparing {len(retry)} previews from the file.")
+            jobs = [self.render_pool.submit(self.make_preview, clip, source, None) for clip in retry]
+            for index, future in enumerate(as_completed(jobs), 1):
+                future.result()
+                update(progress=25 + int(70 * index / len(jobs)))
+            return {"message": "Original attached.", "source": public_source(source), "clip_ids": ids}
+        finally:
+            pending.unlink(missing_ok=True)
+
+    def playback_window(self, source, second):
+        """Build one user-requested source window. Keep only recent playable windows on disk."""
+        local = self.media_source(source)
+        duration = min(local["duration"], source["duration"])
+        length = min(30, duration / 2)
+        if not 0 <= second < duration:
+            raise ValueError("Choose a time within the source.")
+        index = int(second / length)
+        start, end = index * length, min((index + 1) * length, duration)
+        key = hashlib.sha256(f"context:{local['id']}:{index}".encode()).hexdigest()[:32]
+        output = self.context_media / f"{key}.mp4"
+
+        def prepare_window(update, scratch):
+            if not output.exists():
+                update(progress=15, message="Preparing this part of the source for playback.")
+                settings = {"resolution": "480", "ratio": "source", "quality": "fast", "embed_subtitles": False}
+                self.render_pool.submit(media.render_clip, local, output, start, end, settings, [], preview=True).result()
+            with self.lock:
+                os.utime(output)
+                for stale in sorted(self.context_media.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)[12:]:
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass  # A browser can still hold a window open on Windows.
+            return {"message": "Source ready to play.", "playback_url": f"/context/{key}.mp4", "start": start, "end": end}
+
+        with self.lock:
+            for existing, job_id in list(self.context_jobs.items()):
+                job = self.db.get("job", job_id)
+                if job and job["status"] in {"queued", "running"}:
+                    if existing == key:
+                        return job_id
+                else:
+                    del self.context_jobs[existing]
+            job_id = self.schedule("Queued for source playback.", prepare_window)
+            self.context_jobs[key] = job_id
+            return job_id
+
     def speech_key(self, source, language, model=None):
         model = model or speech.selected_model()
         return hashlib.sha256(f"v2\0{source['fingerprint']}\0{language}\0{model}".encode()).hexdigest()
@@ -269,7 +392,7 @@ class Studio:
             method, energy = "captions", None
         else:
             update(progress=15, message="Preparing audio only for local transcription.")
-            audio = media.analysis_audio(source, scratch)
+            audio = media.analysis_audio(self.media_source(source), scratch)
             energy = speech.audio_energy(audio)
             update(progress=25, message="Transcribing the full audio locally. First use may fetch model weights.")
             last = 25
@@ -314,7 +437,15 @@ class Studio:
         update(clip_ids=clip_ids, analysis_method=data["method"], detected_language=data["language"],
                notes=notes, cached=cached, _speech_key=cache_key)
         if not candidates:
-            return {"message": "No complete speech highlights fit these settings."}
+            if settings.get("target_duration") is not None:
+                flexible = highlights.select_highlights(data["words"], source["duration"],
+                                                       {**settings, "target_duration": None}, data["energy"])
+                if flexible:
+                    return {"message": "No complete speech passage fits the exact requested duration.",
+                            "natural_duration_available": True,
+                            "notes": notes + ["Natural-length speech highlights are available within your minimum and maximum durations. Choose Find natural-length clips to prepare them."]}
+            return {"message": "No complete speech highlights fit these settings.",
+                    "notes": notes + ["This speech-first detector needs connected dialogue. Sparse dialogue, music, and action scenes can produce no candidates. Try a shorter minimum duration or review the source to choose a passage."]}
 
         transcript = self.subtitle_speech(source, data, settings)
         subtitle_key = identifier()
@@ -332,7 +463,7 @@ class Studio:
         count = len(clips)
         update(clip_ids=clip_ids, _subtitle_key=subtitle_key, progress=55,
                message=f"Preparing {count} clip previews in parallel.")
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 180
         jobs = [self.render_pool.submit(self.make_preview, clip, source, transcript, deadline=deadline)
                 for clip in clips]
         ready = 0
@@ -356,7 +487,9 @@ class Studio:
         revision = identifier()
         output = self.previews / f"{revision}.mp4"
         try:
-            media.render_clip(source, output, clip["start"], clip["end"],
+            if words is None:
+                words = self.clip_words(clip)
+            media.render_clip(self.media_source(source), output, clip["start"], clip["end"],
                               clip["settings"], words, preview=True, deadline=deadline)
             clip.update(revision=revision, preview_status="ready", preview_error=None)
         except Exception as exc:
@@ -385,7 +518,7 @@ class Studio:
                 raise Conflict("Only clips with an approved, playable preview can be exported.")
         return clips
 
-    def export(self, snapshots, update, scratch, *, allow_fallback=False):
+    def export(self, snapshots, update, scratch, *, allow_fallback=False, mode="quality"):
         update(progress=5, message="Choose a destination in the folder picker on this computer.")
         with self.picker_lock:
             selected = self.picker()
@@ -397,9 +530,10 @@ class Studio:
             if any(clip["revision"] != snap["revision"] for clip, snap in zip(clips, snapshots)):
                 raise Conflict("An approved preview changed. Review it again before exporting.")
         files, failed = {}, {}
-        update(progress=10, message=f"Rendering {len(clips)} approved clips.")
+        verb = "Saving" if mode == "preview" else "Rendering"
+        update(progress=10, message=f"{verb} {len(clips)} approved clips.")
         jobs = {self.render_pool.submit(self.export_clip, clip, destination, scratch,
-                                       allow_fallback=allow_fallback): index
+                                       allow_fallback=allow_fallback, mode=mode): index
                 for index, clip in enumerate(clips)}
         for completed, future in enumerate(as_completed(jobs), 1):
             index = jobs[future]
@@ -416,31 +550,40 @@ class Studio:
             result.update(status="error", error="Every approved clip failed to export.")
         return result
 
-    def export_clip(self, clip, destination, scratch, *, allow_fallback=False):
+    def copy_approved_preview(self, clip, video):
+        revision = clip.get("revision") or ""
+        if not IDENTIFIER.fullmatch(revision):
+            raise ValueError("Regenerate the approved preview before saving it.")
+        preview = self.previews / f"{revision}.mp4"
+        if not preview.is_file() or preview.is_symlink():
+            raise ValueError("This preview expired. Regenerate and approve it again.")
+        shutil.copyfile(preview, video)
+        info = media.inspect_upload(video)
+        if (info["video_codec"] != "h264" or info["audio_codec"] not in {None, "aac"}
+                or abs(info["duration"] - clip["duration"]) > .09 + 2 / max(1, info["fps"])):
+            raise RuntimeError("The approved preview could not be verified for export.")
+        return info
+
+    def export_clip(self, clip, destination, scratch, *, allow_fallback=False, mode="quality"):
         source = self.get("source", clip["source_id"])
-        words = self.clip_words(clip)
         start, end = clip["start"], clip["end"]
         stem = f"ChaoticClips_{int(start):06d}s_{identifier()[:12]}"
         video = scratch / f"{stem}.mp4"
         settings = clip["settings"]
-        try:
-            info = media.render_clip(source, video, start, end, settings, words)
-        except RuntimeError:
-            if not allow_fallback or source["kind"] != "youtube":
-                raise
-            revision = clip.get("revision", "")
-            if not revision or not IDENTIFIER.fullmatch(revision):
-                raise
-            preview = self.previews / f"{revision}.mp4"
-            if not preview.is_file() or preview.is_symlink():
-                raise
-            shutil.copyfile(preview, video)
-            info = media.inspect_upload(video)
-            if (info["video_codec"] != "h264" or info["audio_codec"] != "aac"
-                    or abs(info["duration"] - (end - start)) > .09 + 2 / max(1, info["fps"])):
-                raise RuntimeError("The approved preview could not be verified for export.") from None
-            info["quality_note"] = "Saved the approved lower-resolution preview after YouTube export failed."
         transcript_format = settings["transcript_format"]
+        words = (self.clip_words(clip) if transcript_format != "none"
+                 or mode == "quality" and settings["embed_subtitles"] else [])
+        if mode == "preview":
+            info = self.copy_approved_preview(clip, video)
+            info["quality_note"] = "Saved the reviewed MP4 at preview resolution."
+        else:
+            try:
+                info = media.render_clip(self.media_source(source), video, start, end, settings, words)
+            except RuntimeError:
+                if not allow_fallback or source["kind"] != "youtube":
+                    raise
+                info = self.copy_approved_preview(clip, video)
+                info["quality_note"] = "Saved the approved lower-resolution preview after YouTube export failed."
         artifacts = [video]
         if transcript_format != "none":
             transcript = scratch / f"{stem}.{transcript_format}"

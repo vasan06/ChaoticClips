@@ -9,8 +9,10 @@ import subprocess
 import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from functools import lru_cache
 from pathlib import Path
+from threading import Event, Lock
 from urllib.error import URLError
 from urllib.parse import parse_qs, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -25,6 +27,9 @@ _DIRECT_FORMATS = {"mp4", "webm", "m4a"}
 _MAX_DURATION = 3 * 3600
 _ASPECTS = {"9:16": (9, 16), "16:9": (16, 9), "1:1": (1, 1), "4:5": (4, 5)}
 _QUALITY = {"fast": ("veryfast", "23"), "standard": ("fast", "20"), "high": ("medium", "17")}
+_HLS_DOWNLOADS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="youtube-segment")
+_HLS_MAX_BYTES = 192 * 1024 * 1024
+_SECTION_TIMEOUT = "The YouTube section download timed out."
 
 
 def canonical_url(url):
@@ -123,11 +128,11 @@ class _RestrictedRedirects(HTTPRedirectHandler):
         return super().redirect_request(request, file, code, message, headers, next_url)
 
 
-def _open(url, purpose, headers=None):
+def _open(url, purpose, headers=None, *, timeout=7):
     if not _remote_url(url, purpose):
         raise URLError("Unapproved media URL")
     opener = build_opener(ProxyHandler({}), _RestrictedRedirects(purpose))
-    return opener.open(Request(url, headers=headers or {}), timeout=7)
+    return opener.open(Request(url, headers=headers or {}), timeout=timeout)
 
 
 def _display_thumbnail(url):
@@ -341,12 +346,13 @@ def _local_input(path, start=0):
     ]
 
 
-def _remote_input(item, start=None):
+def _remote_input(item, start=None, *, deadline=None):
     headers = _remote_headers(item)
     url = item["url"]
     if start is not None:
         try:
-            with _open(url, "media", {**headers, "Range": "bytes=0-0"}) as response:
+            with _open(url, "media", {**headers, "Range": "bytes=0-0"},
+                       timeout=_request_timeout(deadline)) as response:
                 if response.status != 206 or not re.fullmatch(r"bytes 0-0/[1-9][0-9]*", response.headers.get("Content-Range", "")):
                     raise RuntimeError("The provider does not support an accurate byte-range request.")
                 url = response.geturl()
@@ -369,10 +375,19 @@ def _remote_input(item, start=None):
     return args
 
 
-def _hls_section(item, playlist, start, end):
+def _request_timeout(deadline):
+    if deadline is None:
+        return 7
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(_SECTION_TIMEOUT)
+    return min(7, remaining)
+
+
+def _hls_section(item, playlist, start, end, *, deadline=None):
     """Build a VOD playlist containing only segments intersecting this cut."""
     headers = _remote_headers(item)
-    with _open(item["url"], "manifest", headers) as response:
+    with _open(item["url"], "manifest", headers, timeout=_request_timeout(deadline)) as response:
         data = response.read(4 * 1024 * 1024 + 1)
         base = response.geturl()
     if len(data) > 4 * 1024 * 1024:
@@ -420,6 +435,8 @@ def _hls_section(item, playlist, start, end):
                 break
     if not selected or elapsed + 0.15 < end:
         raise RuntimeError("The YouTube playlist does not cover this cut.")
+    if deadline is not None and len(selected) == sum(line.startswith("#EXTINF:") for line in lines):
+        raise RuntimeError("This cut would require the entire YouTube stream. Choose a shorter section.")
 
     target_duration = math.ceil(max(seconds for seconds, _, _ in selected))
     output = ["#EXTM3U", "#EXT-X-VERSION:7", f"#EXT-X-TARGETDURATION:{target_duration}",
@@ -433,11 +450,45 @@ def _hls_section(item, playlist, start, end):
     return max(0.0, start - earliest)
 
 
-def _localize_hls(playlist, headers, deadline):
-    """Fetch the selected segments to scratch through the restricted HTTPS client."""
+def _localize_hls(playlist, headers, deadline, *, limit=_HLS_MAX_BYTES):
+    """Fetch only selected segments, with a shared byte budget and bounded parallelism."""
     lines = playlist.read_text(encoding="utf-8").splitlines()
     fragmented = any(line.startswith("#EXT-X-MAP:") for line in lines)
-    bytes_left = 192 * 1024 * 1024
+    bytes_left = limit
+    lock = Lock()
+    stopped = Event()
+
+    def fetch(url, path):
+        nonlocal bytes_left
+        if stopped.is_set():
+            return
+        try:
+            with _open(url, "media", headers, timeout=_request_timeout(deadline)) as response, path.open("wb") as target:
+                received = 0
+                length = response.headers.get("Content-Length")
+                read = getattr(response, "read1", response.read)
+                while not stopped.is_set():
+                    _request_timeout(deadline)
+                    block = read(64 * 1024)
+                    if not block:
+                        break
+                    _request_timeout(deadline)
+                    with lock:
+                        if len(block) > bytes_left:
+                            raise RuntimeError("The selected YouTube section exceeded its download size limit.")
+                        bytes_left -= len(block)
+                    target.write(block)
+                    received += len(block)
+                if not stopped.is_set() and (not received or (length and length.isdecimal() and received != int(length))):
+                    raise RuntimeError("A YouTube segment ended before its media finished downloading.")
+        except TimeoutError:
+            raise RuntimeError(_SECTION_TIMEOUT) from None
+        except OSError as error:
+            if isinstance(error, URLError) and isinstance(error.reason, TimeoutError):
+                raise RuntimeError(_SECTION_TIMEOUT) from None
+            raise RuntimeError("A YouTube segment could not be downloaded.") from None
+
+    downloads = []
     for index, line in enumerate(lines):
         init = line.startswith("#EXT-X-MAP:")
         if not init and (not line or line.startswith("#")):
@@ -445,25 +496,34 @@ def _localize_hls(playlist, headers, deadline):
         url = line.removeprefix('#EXT-X-MAP:URI="').removesuffix('"') if init else line
         suffix = ".mp4" if init else (".m4s" if fragmented else ".ts")
         path = playlist.with_name(f"{playlist.stem}-{index}{suffix}")
-        if time.monotonic() >= deadline:
-            raise RuntimeError("YouTube segments did not finish downloading in time.")
-        with _open(url, "media", headers) as response, path.open("wb") as target:
-            while block := response.read(256 * 1024):
-                bytes_left -= len(block)
-                if time.monotonic() >= deadline or bytes_left < 0:
-                    raise RuntimeError("This YouTube stream exceeded the section transfer limit.")
-                target.write(block)
+        downloads.append((url, path))
         lines[index] = f'#EXT-X-MAP:URI="{path.name}"' if init else path.name
+    futures = [_HLS_DOWNLOADS.submit(fetch, url, path) for url, path in downloads]
+    try:
+        for future in as_completed(futures, timeout=max(0, deadline - time.monotonic())):
+            future.result()
+    except TimeoutError:
+        raise RuntimeError(_SECTION_TIMEOUT) from None
+    finally:
+        stopped.set()
+        wait([future for future in futures if not future.cancel()])
     playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _section_input(item, scratch, start, end, name, *, deadline=None):
     if item["protocol"] == "https":
-        return _remote_input(item, start)
+        return _remote_input(item, start, deadline=deadline)
     import certifi
 
     playlist = scratch / f"{name}.m3u8"
-    offset = _hls_section(item, playlist, start, end)
+    try:
+        offset = _hls_section(item, playlist, start, end, deadline=deadline)
+    except TimeoutError:
+        raise RuntimeError(_SECTION_TIMEOUT) from None
+    except URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise RuntimeError(_SECTION_TIMEOUT) from None
+        raise RuntimeError("YouTube could not open the segment index.") from None
     if deadline is not None:
         _localize_hls(playlist, _remote_headers(item), deadline)
         return [
@@ -569,14 +629,15 @@ def _quality_rank(item, cap, preview):
 def _render_choices(info, cap, preview):
     preferred = list(_stream_choices(info, cap, preview=preview))
     if preview:
-        yield from preferred[:3]
-        return
-    # Reserve attempts for lighter streams so several failures at a high
-    # resolution do not exhaust the time available for a usable export.
-    moderate = list(_stream_choices(info, min(cap or 1080, 1080), preview=True))
-    economical = list(_stream_choices(info, 360, preview=True))
+        economical = list(_stream_choices(info, min(cap or 360, 240), preview=True))
+        candidates = preferred[:1] + economical[:1] + preferred[1:3]
+    else:
+        # Reserve attempts for lighter streams after higher-resolution failures.
+        moderate = list(_stream_choices(info, min(cap or 1080, 1080), preview=True))
+        economical = list(_stream_choices(info, 360, preview=True))
+        candidates = preferred[:2] + moderate[:1] + economical[:2]
     seen = set()
-    for video, audio in preferred[:2] + moderate[:1] + economical[:2]:
+    for video, audio in candidates:
         key = (video["url"], audio["url"] if audio else None)
         if key not in seen:
             seen.add(key)
@@ -584,6 +645,12 @@ def _render_choices(info, cap, preview):
 
 
 def _output_size(width, height, ratio, cap):
+    if ratio == "source":
+        scale = min(1, cap / min(width, height)) if cap else 1
+        size = tuple(min(edge // 2, round(edge * scale / 2)) * 2 for edge in (width, height))
+        if not min(size):
+            raise RuntimeError("The source is too small to render.")
+        return size
     horizontal, vertical = _ASPECTS[ratio]
     factor = min(width // horizontal, height // vertical)
     if cap:
@@ -620,6 +687,16 @@ def _render(inputs, mapping, size, scratch, start, end, settings, words, preview
     return output, result
 
 
+def _section_inputs(video, audio, scratch, start, end, deadline):
+    if audio is None:
+        inputs = _section_input(video, scratch, start, end, "video", deadline=deadline)
+        return inputs, ["-map", "0:v:0", "-map", "0:a:0"]
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="youtube-track") as tracks:
+        video_input = tracks.submit(_section_input, video, scratch, start, end, "video", deadline=deadline)
+        audio_input = tracks.submit(_section_input, audio, scratch, start, end, "audio", deadline=deadline)
+        return video_input.result() + audio_input.result(), ["-map", "0:v:0", "-map", "1:a:0"]
+
+
 def render_clip(source, output, start, end, settings, subtitle_words, *, preview=False, deadline=None):
     start, end = float(start), float(end)
     if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= float(source["duration"])):
@@ -649,12 +726,12 @@ def render_clip(source, output, start, end, settings, subtitle_words, *, preview
         if end - start >= source["duration"] - 0.05:
             raise ValueError("Select a section shorter than the full YouTube video.")
         choices = _render_choices(_youtube_info(source["url"]), cap, preview)
-        render_deadline = time.monotonic() + (60 if preview else 180)
+        render_deadline = time.monotonic() + 180
         deadline = min(deadline, render_deadline) if deadline is not None else render_deadline
         attempted = False
         failure = None
         best_attempted_pixels = 0
-        for video, audio in choices:
+        for index, (video, audio) in enumerate(choices):
             if time.monotonic() >= deadline:
                 break
             attempted = True
@@ -662,24 +739,24 @@ def render_clip(source, output, start, end, settings, subtitle_words, *, preview
                 size = _output_size(video["width"], video["height"], settings["ratio"], cap)
                 pixels = size[0] * size[1]
                 best_attempted_pixels = max(best_attempted_pixels, pixels)
-                attempt_deadline = min(deadline, time.monotonic() + (25 if preview else 35))
-                inputs = _section_input(video, scratch, start, end, "video", deadline=attempt_deadline)
-                mapping = ["-map", "0:v:0", "-map", "0:a:0"]
-                if audio:
-                    inputs.extend(_section_input(audio, scratch, start, end, "audio", deadline=attempt_deadline))
-                    mapping[-1] = "1:a:0"
-                timeout = max(1, attempt_deadline - time.monotonic())
-                rendered, result = _render(inputs, mapping, size, scratch, start, end, settings,
-                                           subtitle_words, preview, timeout=timeout)
-                if not preview and pixels < best_attempted_pixels:
-                    result["quality_note"] = "A lower-resolution stream was used after higher-resolution attempts failed."
-                rendered.replace(output)
-                return result
+                attempt_seconds = 85 if preview else 55
+                attempt_deadline = min(deadline, time.monotonic() + attempt_seconds)
+                transfer_deadline = min(attempt_deadline - 5, time.monotonic() + (65 if preview else 40))
+                with tempfile.TemporaryDirectory(dir=scratch, prefix="attempt-") as attempt:
+                    temporary = Path(attempt)
+                    inputs, mapping = _section_inputs(video, audio, temporary, start, end, transfer_deadline)
+                    timeout = max(1, attempt_deadline - time.monotonic())
+                    rendered, result = _render(inputs, mapping, size, temporary, start, end, settings,
+                                               subtitle_words, preview, timeout=timeout)
+                    if not preview and pixels < best_attempted_pixels:
+                        result["quality_note"] = "A lower-resolution stream was used after higher-resolution attempts failed."
+                    rendered.replace(output)
+                    return result
             except RuntimeError as error:
                 failure = str(error)
             except (OSError, ValueError):
                 continue
     if not attempted:
-        raise RuntimeError("YouTube did not expose a supported stream for this video. You can review the moment in the YouTube player.")
-    guidance = "Review the moment in the YouTube player or use a local upload for export."
+        raise RuntimeError("YouTube did not expose a supported stream. Retry this clip or upload the same full-length original.")
+    guidance = "Retry this clip or upload the same full-length original."
     raise RuntimeError(f"{failure or 'YouTube media could not be rendered as an MP4.'} {guidance}")
