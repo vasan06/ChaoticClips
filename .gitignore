@@ -82,3 +82,5 @@ htmlcov/
 # Private recovery snapshot
 /.rebuild-backup/
 _backup_before_pipeline*/
+
+/.rebuild-reference/

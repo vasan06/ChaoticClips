@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/mehbul/chopify",
+  "commit": "9363aa42b447f098eb1be8fa46b80a3c9d8c7285",
+  "license": "MIT",
+  "local_changes": "Desktop upload/pickers; workspace and URL boundaries; disclosed full-source caching with section-only option; multilingual tiny CPU defaults; source caption reuse; Unicode logging and titles; preview approval signatures; even-size contain rendering; bounded workers; native preview verification. See root README."
+}

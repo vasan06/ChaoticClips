@@ -1,56 +1,53 @@
-﻿# ChaoticClips
+# ChaoticClips local fork
 
-ChaoticClips turns long videos into short clips with a local, speech-first analysis pipeline. Review the actual cut, adjust its timestamps, and approve each clip before exporting. It uses no API keys or paid services.
+Fresh fork of MIT-licensed [Chopify](https://github.com/mehbul/chopify), pinned in `engine/chopify/UPSTREAM.json`. The upstream copyright and license are retained. The prior implementation is preserved in Git stash and `.rebuild-backup`.
 
-## Windows setup from Git Bash
+## Run from Git Bash
 
-1. Install Python 3.12 or newer with Tk, and put `ffmpeg` and `ffprobe` on PATH. Use a full FFmpeg build with libass and libx264. For YouTube, also put Node.js 22+ or Deno on PATH so yt-dlp can handle supported player challenges.
-2. If `.venv` is missing, create it with `python -m venv .venv`. Activate it and install the dependencies with `python -m pip install -r requirements.txt`.
-3. From the project folder, activate the environment and start the app.
+```bash
+cd /d/viral_clip_studio
+source .venv/Scripts/activate
+python -m pip install -r requirements.txt
+python app.py
+```
 
-   ```bash
-   source .venv/Scripts/activate
-   python app.py
-   ```
+Open http://127.0.0.1:8000. Use `python app.py --port 5000` for port 5000.
 
-4. Open [the local studio on port 8000](http://127.0.0.1:8000). Keep Git Bash open while using the app. If port 8000 is busy, run `python app.py --port 5000` and open [port 5000](http://127.0.0.1:5000).
+1. Paste a YouTube URL or choose a local video inside this project directory.
+2. Find clips. The default disclosed reliability mode downloads the full source once and retains it in the project. Clear the cache-source checkbox to use audio-first section-only retrieval. Available source captions are reused; otherwise multilingual Whisper Tiny runs locally. Successful stages are cached.
+3. Select candidates, edit timestamps and captions, then choose Preview selected. Watch the native MP4 drafts.
+4. Keep the desired clips selected and choose Export selected. A native folder picker opens on this computer. Choose a writable folder inside D:\viral_clip_studio, outside `workspace/fresh/projects`. Cancellation prevents the export from starting.
+5. Final MP4s, SRTs, posters, and metadata are saved to that destination. Project copies remain available through Studio.
 
-YouTube and the initial dependency and speech-model downloads require internet access. Local transcription defaults to the faster multilingual Whisper Tiny model. Set `CHAOTICCLIPS_WHISPER_MODEL=base` before starting for higher recognition accuracy at the cost of more CPU time. Models are cached in `workspace/studio/models`, so local video transcription can work offline after the first download.
+Full-frame contain is the default for 9:16. It preserves the picture with padding. Drafts are 720×1280 and final vertical output is 1080×1920. These canvas dimensions do not increase source detail.
 
-## Make a clip
+No account, paid API, trial, credit balance, or per-video usage charge is required. Model downloads need internet on first use. Optional reranking uses a locally installed Ollama model. Model and file processing still need CPU, RAM, disk, and time. YouTube can restrict section retrieval. The source-cache choice is displayed before processing. Section-only mode reports retrieval failures without silently switching to a full download.
 
-1. Load a single YouTube link or choose a local MP4, MOV, MKV, WebM, AVI, or M4V. Local uploads can be up to 2 GiB. Sources can be up to three hours long.
-2. Set the requested count, clip duration range, category, aspect ratio, and output resolution. Under **Language, subtitles, and quality**, you can choose the spoken language, configure embedded subtitles, and request a separate TXT, SRT, or VTT transcript.
-3. Select **Analyze and prepare previews**. The studio fetches available YouTube captions first. If it has to transcribe, it retrieves audio only. Video transfer starts when the selected cuts are rendered as economical previews. YouTube can transfer stream headers and keyframe data around the cut as part of seeking.
-4. Play each candidate as soon as its MP4 appears. Up to three clips render in parallel. Use **View in source** to check surrounding context in the source player, then **Edit timestamps** to regenerate the cut. Uploaded browser-compatible originals support direct full-timeline playback. YouTube source playback retrieves economical sections on demand as you seek or continue watching. This transfers temporary media and depends on section access.
-5. Approve the clips you want and select **Export approved clips**. Choose a folder in the native dialog on the server’s desktop. Canceling the dialog leaves the export unstarted. Once a folder is selected and validated, the studio renders the clips, then lists the filenames and destination.
+## Development procedure
 
-For YouTube, enable **Save the approved preview if YouTube export fails** if you want the existing lower-resolution MP4 as a backup. The export result lists the actual dimensions and reports any quality fallback.
+The licensed upstream engine, dashboard, and regression tests are under `engine/chopify`. Read the upstream [workflow](https://github.com/mehbul/chopify/blob/main/docs/WORKFLOWS.md) and [contribution procedure](https://github.com/mehbul/chopify/blob/main/CONTRIBUTING.md). Local policy changes are described in `UPSTREAM.json`. Keep caches, credentials, media, and backups outside Git. Retain the MIT license when modifying or distributing this fork.
 
-An approved card also offers **Download final MP4** and **Save preview MP4**. Both open the folder picker. Saving the preview copies the reviewed lower-resolution file immediately, without retrieving YouTube media again.
+Use the project virtual environment, pytest, and `--basetemp` inside `workspace/fresh`. All generated data stays in the project. Focused test results and current limits are recorded below.
 
-If YouTube sections fail, **Attach the same full-length video** preserves the analysis and timestamps and prepares failed previews from your local original. The duration must match within one second. Confirm it is the same edit because matching duration alone cannot establish identical content. Rejected candidates keep their decision.
+## Current differences from upstream
 
-## Verification
+- The native folder picker gates final exports. Current previews and selections are required before export.
+- Only public YouTube URLs and local project videos are accepted. Local media serving is restricted.
+- A complete source cache is the disclosed default, approved during this rebuild. Section-only retrieval remains available. Format detection preserves user framing and duration choices.
+- The local CPU default is multilingual Whisper Tiny with bounded workers. Paid-provider and external-agent autodetection is disabled.
+- Section requests use two-second padding and three-second merge gaps. Independent sections and renders use bounded concurrency.
+- Campaign briefs default to keyword rules. Visual detection and semantic scoring are editing aids and require human review.
+- The native local file picker reads project files in place. Browser upload copies supported videos up to 2 GiB into the local workspace.
 
-The current playback and save changes were exercised with real FFmpeg output through the Flask API. A controlled HTTPS transport fixture verified two disjoint nonzero cuts, section-only retrieval, H.264/AAC output, embedded subtitle rendering, transcript export, range playback, source-context seeking, approval gating, folder cancellation, and byte-for-byte preview saving without another section request. MP4 and MKV original attachment recovery also passed with distinctive video frames and audio tones. The transport fixture substitutes provider responses and does not verify current YouTube access.
 
-The exact failing live YouTube URL and interactive browser behavior remain unverified in this revision. Network and isolated Chrome launch escalation requests were rejected. Five-minute processing is a target whose outcome depends on source duration, caption availability, CPU speed, and provider transfer speed.
+## Verified rebuild results
 
-## Behavior and limits
+- 135 focused regression tests passed, covering actual FFmpeg renders, captions, evidence analysis, ingestion, timeline scanning, upload/range HTTP routes, preview-before-export checks, destination cancellation, selected-folder output, edited-timestamp invalidation, cache reuse, background noninteractive execution, and Tamil Unicode handling.
+- Real public-video section requests at 848.079–878.079 seconds timed out with the original section-only downloader. The approved full-source strategy successfully cached this same video in 71.3 seconds (approximately 203 MiB).
+- A real 30.000-second 1080×1920 H.264/AAC output from that exact source interval rendered locally in 16.2 seconds with embedded Tamil source captions. Decoded output matched the corresponding source frame with mean pixel difference 1.96/255 in the image region.
+- Actual browser review of the YouTube project completed three current candidate previews and confirmed native MP4 playback with readyState 4 and no media error. Previous draft variants may remain listed as cached outputs.
+- The fresh app was started on port 5000 because port 8000 was already occupied. The existing listener on 8000 was left in place.
 
-- The Windows folder picker needs an interactive desktop. Open the browser on the host machine and select the folder in the desktop dialog. Headless or remote-only sessions cannot choose an export folder.
-- MP4 previews use a smaller output size for faster review. The selected resolution applies to exports. YouTube access, connection speed and source duration affect total processing time, especially when captions are unavailable and speech must be transcribed. A local upload can supply exportable media when YouTube playback works but section rendering fails.
-- Resolution settings cap the output’s shorter edge. The center crop preserves the requested aspect ratio and uses available source detail. The studio does not upscale or automatically track speakers.
-- Caption timing is word-level where the source provides alignments. Some YouTube tracks contain phrase-level timestamps, so word timing in those tracks is estimated. Subtitle language selection uses available source tracks. Translation and visual-only highlights are deferred.
-- SQLite persists jobs, clip decisions, and cached analysis. Previews expire after seven days and can be regenerated while analysis is cached. Uploaded sources and approved exports are retained.
-- The server binds to loopback for single-user desktop use. Uploads stay on the machine. Nothing is posted or published by the application.
+The timed download and render were separate checks. They do not establish a universal five-minute processing guarantee. The test suite exercised folder selection with controlled choices; a human-driven native folder dialog was not executed during browser verification. Source-caption word timing may be estimated within phrases. Highlight scores are heuristic editing suggestions, with a visible configurable filter (default 5/10), and need human review. New projects default to three 20–60-second candidates; the controls remain editable. The broader upstream agent/live/cloud workflows are outside this fork's verified scope. Live controls are hidden and no automatic publishing is configured.
 
-## Project layout
-
-- `app.py` starts the local Flask server.
-- `chaoticclips/` contains the analysis, rendering, subtitles, and export modules.
-- `templates/` and `static/` contain the browser interface.
-- `workspace/studio/` holds local uploads, previews, model weights, and SQLite data.
-
-The private pre-rebuild backup is at `.rebuild-backup/before-rebuild`.
+The verified selected-source sample is `workspace/fresh/live-check/verified/verified-selected-source-moment.mp4`. Prior work is retained in the Git stash named `ChaoticClips preserved before GitHub-based fresh rebuild`, with a separate verified snapshot under `.rebuild-backup/before-fresh-20261124-201529`.
