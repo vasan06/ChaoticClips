@@ -22,10 +22,20 @@ YouTube and the initial dependency and speech-model downloads require internet a
 1. Load a single YouTube link or choose a local MP4, MOV, MKV, WebM, AVI, or M4V. Local uploads can be up to 2 GiB. Sources can be up to three hours long.
 2. Set the requested count, clip duration range, category, aspect ratio, and output resolution. Under **Language, subtitles, and quality**, you can choose the spoken language, configure embedded subtitles, and request a separate TXT, SRT, or VTT transcript.
 3. Select **Analyze and prepare previews**. The studio fetches available YouTube captions first. If it has to transcribe, it retrieves audio only. Video transfer starts when the selected cuts are rendered as economical previews. YouTube can transfer stream headers and keyframe data around the cut as part of seeking.
-4. Play each candidate as soon as its MP4 appears. Up to three clips render in parallel. For a YouTube source, **Play YouTube segment** opens the identified moment even while its MP4 is being prepared. YouTube seeks are approximate. Review the rendered MP4 before approving it. Use **Edit timestamps** to regenerate it.
+4. Play each candidate as soon as its MP4 appears. Up to three clips render in parallel. Use **View in source** to check surrounding context in the source player, then **Edit timestamps** to regenerate the cut. Uploaded browser-compatible originals support direct full-timeline playback. YouTube source playback retrieves economical sections on demand as you seek or continue watching. This transfers temporary media and depends on section access.
 5. Approve the clips you want and select **Export approved clips**. Choose a folder in the native dialog on the server’s desktop. Canceling the dialog leaves the export unstarted. Once a folder is selected and validated, the studio renders the clips, then lists the filenames and destination.
 
 For YouTube, enable **Save the approved preview if YouTube export fails** if you want the existing lower-resolution MP4 as a backup. The export result lists the actual dimensions and reports any quality fallback.
+
+An approved card also offers **Download final MP4** and **Save preview MP4**. Both open the folder picker. Saving the preview copies the reviewed lower-resolution file immediately, without retrieving YouTube media again.
+
+If YouTube sections fail, **Attach the same full-length video** preserves the analysis and timestamps and prepares failed previews from your local original. The duration must match within one second. Confirm it is the same edit because matching duration alone cannot establish identical content. Rejected candidates keep their decision.
+
+## Verification
+
+The current playback and save changes were exercised with real FFmpeg output through the Flask API. A controlled HTTPS transport fixture verified two disjoint nonzero cuts, section-only retrieval, H.264/AAC output, embedded subtitle rendering, transcript export, range playback, source-context seeking, approval gating, folder cancellation, and byte-for-byte preview saving without another section request. MP4 and MKV original attachment recovery also passed with distinctive video frames and audio tones. The transport fixture substitutes provider responses and does not verify current YouTube access.
+
+The exact failing live YouTube URL and interactive browser behavior remain unverified in this revision. Network and isolated Chrome launch escalation requests were rejected. Five-minute processing is a target whose outcome depends on source duration, caption availability, CPU speed, and provider transfer speed.
 
 ## Behavior and limits
 

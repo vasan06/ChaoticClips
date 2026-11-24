@@ -123,7 +123,7 @@ def create_app(data_dir=None, folder_picker=None):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "img-src 'self' https://i.ytimg.com https://*.ytimg.com https://img.youtube.com; "
-            "media-src 'self'; frame-src https://www.youtube-nocookie.com; connect-src 'self'; base-uri 'none'; "
+            "media-src 'self'; frame-src 'none'; connect-src 'self'; base-uri 'none'; "
             "frame-ancestors 'none'; form-action 'self'"
         )
         if request.path.startswith("/api/") or request.path == "/":
@@ -148,7 +148,7 @@ def create_app(data_dir=None, folder_picker=None):
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
-        message = "Uploads must be 2 GiB or less." if exc.code == 413 and request.path == "/api/upload" else exc.description
+        message = "Uploads must be 2 GiB or less." if exc.code == 413 and request.mimetype == "multipart/form-data" else exc.description
         return jsonify(error=message), exc.code
 
     @app.get("/")
@@ -162,9 +162,17 @@ def create_app(data_dir=None, folder_picker=None):
                                         lambda update, _: studio.inspect_remote(url, update)))
 
     @app.post("/api/upload")
-    def upload_route():
+    @app.post("/api/sources/<source_id>/attach")
+    def upload_route(source_id=None):
         if request.mimetype != "multipart/form-data":
             raise ValueError("Choose a local video file.")
+        analysis_id = None
+        if source_id is not None:
+            if studio.get("source", source_id)["kind"] != "youtube":
+                raise ValueError("Choose a YouTube source to attach an original.")
+            analysis_id = request.form.get("analysis_job_id") or None
+            if analysis_id and not IDENTIFIER.fullmatch(analysis_id):
+                raise ValueError("Choose a valid analysis for this video.")
         upload = request.files.get("file")
         filename = (upload.filename if upload else "") or ""
         filename = filename.replace("\\", "/").split("/")[-1][:255]
@@ -185,8 +193,13 @@ def create_app(data_dir=None, folder_picker=None):
                     target.write(chunk)
             if not size:
                 raise ValueError("The selected file is empty.")
-            job_id = studio.schedule("Queued to check the local video.",
-                                     lambda update, _: studio.inspect_local(path, filename, digest.hexdigest(), update))
+            if source_id:
+                job_id = studio.schedule("Queued to check the full-length original.",
+                                         lambda update, _: studio.attach_original(
+                                             source_id, analysis_id, path, filename, digest.hexdigest(), update))
+            else:
+                job_id = studio.schedule("Queued to check the local video.",
+                                         lambda update, _: studio.inspect_local(path, filename, digest.hexdigest(), update))
             queued = True
             return accepted(job_id)
         except OSError as exc:
@@ -221,6 +234,32 @@ def create_app(data_dir=None, folder_picker=None):
         if not path.is_file() or path.is_symlink():
             abort(404)
         return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
+
+    @app.post("/api/sources/<source_id>/playback")
+    def source_playback(source_id):
+        source = studio.get("source", source_id)
+        second = number(payload({"time"}).get("time"), 0, source["duration"], "Playback time")
+        return accepted(studio.playback_window(source, second))
+
+    @app.get("/context/<revision>.mp4")
+    def context_window(revision):
+        if not IDENTIFIER.fullmatch(revision):
+            abort(404)
+        path = studio.context_media / f"{revision}.mp4"
+        if path.is_symlink() or not path.is_file():
+            abort(404)
+        return send_file(path, mimetype="video/mp4", conditional=True, max_age=0)
+
+    @app.get("/source/<source_id>/original")
+    def original_video(source_id):
+        source = studio.get("source", source_id)
+        if not public_source(source).get("playback_url"):
+            abort(404)
+        path = Path(studio.media_source(source)["path"])
+        if path.is_symlink() or path.resolve().parent != studio.uploads or not path.is_file():
+            abort(404)
+        mime = "video/webm" if path.suffix.lower() == ".webm" else "video/mp4"
+        return send_file(path, mimetype=mime, conditional=True, max_age=0)
 
     @app.post("/api/clips/<clip_id>/review")
     def review_route(clip_id):
@@ -266,8 +305,11 @@ def create_app(data_dir=None, folder_picker=None):
 
     @app.post("/api/export")
     def export_route():
-        data = payload({"clip_ids", "allow_preview_fallback"})
+        data = payload({"clip_ids", "allow_preview_fallback", "mode"})
         keys = data.get("clip_ids")
+        mode = data.get("mode", "quality")
+        if mode not in ("quality", "preview"):
+            raise ValueError("Choose export quality or save the reviewed preview.")
         allow_fallback = data.get("allow_preview_fallback", False)
         if type(allow_fallback) is not bool:
             raise ValueError("Choose whether to allow the approved preview as an export fallback.")
@@ -279,7 +321,7 @@ def create_app(data_dir=None, folder_picker=None):
             clips = studio.approved(keys)
             return accepted(studio.schedule("Queued to open the destination picker.",
                                             lambda update, scratch: studio.export(
-                                                clips, update, scratch, allow_fallback=allow_fallback)))
+                                                clips, update, scratch, allow_fallback=allow_fallback, mode=mode)))
 
     return app
 
