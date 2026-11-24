@@ -1,1 +1,0 @@
-"""Local video clipping services."""
